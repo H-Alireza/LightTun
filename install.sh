@@ -30,7 +30,7 @@ if command -v fuser >/dev/null && lock_busy; then
 fi
 APT=(apt-get -o DPkg::Lock::Timeout=600 -o Acquire::http::Timeout=15 -o Acquire::Retries=1 -y -qq)
 
-PKGS=(iproute2 iptables iputils-ping iperf3 curl ca-certificates conntrack python3 unzip tar kmod ethtool irqbalance)
+PKGS=(iproute2 iptables iputils-ping iperf3 curl ca-certificates conntrack python3 unzip tar kmod ethtool irqbalance wireguard-tools)
 
 # Iranian servers often can't reach the default Ubuntu mirrors; fall back to Iranian mirrors for this
 # install only (a temporary sources list, the server's apt config is left untouched)

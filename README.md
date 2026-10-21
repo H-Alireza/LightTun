@@ -22,10 +22,35 @@ Then run `lighttun` to open the menu, or use the commands below.
 | `ipip` | kernel | lowest | Smallest overhead. Only one per server pair. |
 | `vxlan` | kernel, UDP | low | When GRE is blocked. |
 | `fou` | kernel, UDP | very low | GRE inside UDP: costs about the same as GRE but looks like UDP on the network. |
+| `wg` | kernel WireGuard | low | Encrypted, so filters can't look inside. Good for gaming. Both keys come from one `--secret`. |
 | `fec` | tinyfecVPN | medium | Lossy routes. Error correction removes lag spikes. Add `--raw yes` to wrap it in fake TCP (udp2raw) where UDP is throttled. |
 | `rathole` | rathole | medium | Reverse TCP/UDP port tunnel, for when the far side can't accept incoming connections. Not for gaming. |
 
 Every tunnel survives reboots (it runs as a systemd service `lighttun@NAME` or `lighttun-proc@NAME`). Its config is in `/etc/lighttun/tunnels/NAME.conf`.
+
+## Filtered routes (Iran → abroad): `--opener`
+
+On many Iranian servers the filter works by **who starts the flow**, not by protocol:
+
+- a flow the Iran server starts toward an abroad server gets about 6 packets through, then it is cut, and it stays cut while Iran keeps sending
+- a flow the abroad server starts passes in both directions, whatever the protocol or port
+- the filter forgets an idle flow after about 15–45 s
+
+`--opener` makes the abroad server always open the tunnel:
+
+```bash
+# abroad server
+lighttun add --name t1 --type vxlan --opener me   --local ABROAD --remote IRAN   --addr 10.77.20.2/30 ...
+# Iran server (lighttun peer t1 prints this line for you)
+lighttun add --name t1 --type vxlan --opener peer --local IRAN   --remote ABROAD --addr 10.77.20.1/30 ...
+```
+
+- `me` (abroad): sends a keepalive every second, so the flow never goes idle. `wg` does this with persistent-keepalive.
+- `peer` (Iran): a kernel firewall rule (iptables `recent`) holds this side's tunnel packets until the abroad side has been heard from in the last 10 s, so Iran never starts the flow. A `wg` tunnel on this side has no endpoint at all.
+- VXLAN and FOU use a fixed source port, so each tunnel is one flow.
+- It costs almost no CPU, and it is harmless on routes that aren't filtered.
+
+**Don't use GRE on filtered routes.** GRE is not encrypted and the filter reads the packets inside it: pings pass, but TCP connections inside get cut. Use `vxlan` (fastest) or `wg` (encrypted, safest if the filter starts reading VXLAN too).
 
 ## Everyday commands
 
@@ -76,15 +101,16 @@ lighttun bench serve <IP of A>
 lighttun bench run <IP of B>
 ```
 
-The benchmark creates temporary GRE, IPIP, VXLAN and FOU tunnels, plus these FEC and reverse variants:
+The benchmark creates temporary GRE, IPIP, VXLAN, FOU and WireGuard tunnels, all opened by the abroad (serve) side as with `--opener`, plus these FEC and reverse variants:
 
 - `fec`: FEC over plain UDP
 - `fecraw`: FEC disguised as TCP (udp2raw)
-- `fecrev`: the same, but the abroad server opens the connection (reverse)
+- `fecrev`: FEC over plain UDP, opened by the abroad server (reverse)
 - `fecicmp`: FEC disguised as ping
 - `rathole`: reverse TCP tunnel, opened by the abroad server
 
-The FEC variants need `install fec` and rathole needs `install rathole`.
+The FEC variants need `install fec`, rathole needs `install rathole`, and `wg` needs `wireguard-tools` (the installer adds it).
+To test only some types, list them on both sides: `lighttun bench serve IP vxlan wg` and `lighttun bench run IP vxlan wg`.
 A type that connects but loses more than half its packets is reported as **BLOCKED** and skipped right away, which is common on filtered Iranian routes.
 
 On each type that works, it measures:
@@ -94,6 +120,7 @@ On each type that works, it measures:
 - ping while a TCP transfer is running (bufferbloat)
 - upload and download speed
 - CPU use
+- the largest packet that really passes through the tunnel (MTU column), so you can set `--mtu`
 
 Then it ranks the tunnels with a **gaming score** and a **bulk score**, and removes everything when it's done. A full run takes about 2-3 minutes.
 
