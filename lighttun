@@ -1080,38 +1080,70 @@ banner() {
   echo
 }
 
+menu_qos() {
+  local c
+  echo "  1) Turn on   2) Turn off   3) Show status"
+  read -rp "> " c
+  case $c in 1) cmd_qos on ;; 2) cmd_qos off ;; 3) cmd_qos status ;; esac
+}
+
+menu_bench() {
+  local c ip
+  echo "  Run 'Wait for test' on the other server FIRST, then 'Start test' here."
+  echo "  1) Wait for test (this is server B)"
+  echo "  2) Start test    (this is server A)"
+  read -rp "> " c
+  read -rp "Other server's public IP: " ip
+  case $c in 1) cmd_bench serve "$ip" ;; 2) cmd_bench run "$ip" ;; esac
+}
+
+menu_tunnel_ctl() {
+  local n c
+  n=$(pick_tunnel) || return
+  echo "  1) Restart   2) Stop   3) Start"
+  read -rp "> " c
+  case $c in 1) for_tunnels restart "$n" ;; 2) for_tunnels down "$n" ;; 3) for_tunnels up "$n" ;; esac
+}
+
 cmd_menu() {
   need_root
-  local c n
+  local c
   while true; do
+    clear
     banner
     cmd_status 2>/dev/null; echo
     cat <<EOF
-  1) Add tunnel            6) Health check now
-  2) Edit tunnel           7) Gaming priority (QoS)
-  3) Delete tunnel         8) Benchmark tunnels
-  4) Restart tunnel        9) Telegram alerts
-  5) Show command for other server
- 10) Optimize server      11) Install FEC/udp2raw   12) Install rathole
-  0) Exit
+  ${W}Tunnels${N}
+   1) Add tunnel                 4) Start / stop / restart
+   2) Edit tunnel                5) Command for the other server
+   3) Delete tunnel              6) Health check now
+  ${W}Tools${N}
+   7) Gaming priority (QoS)      8) Benchmark tunnel types
+   9) Telegram alerts           10) Optimize server
+  11) Install FEC + udp2raw     12) Install rathole
+   0) Exit
 EOF
     read -rp "> " c; echo
-    case $c in
-      1) cmd_add ;;
-      2) cmd_edit ;;
-      3) cmd_del ;;
-      4) n=$(pick_tunnel) && for_tunnels restart "$n" ;;
-      5) cmd_peer ;;
-      6) cmd_health ;;
-      7) read -rp "on / off / status: " n; cmd_qos "$n" ;;
-      8) read -rp "serve or run: " n; read -rp "Other server's public IP: " c; cmd_bench "$n" "$c" ;;
-      9) cmd_telegram ;;
-      10) cmd_optimize ;;
-      11) install_fec ;;
-      12) install_rathole ;;
-      0|q) exit 0 ;;
-    esac
-    echo; read -rp "Press Enter to continue..." _; clear
+    [[ $c == 0 || $c == q ]] && exit 0
+    # each action runs in a subshell so an input error returns here instead of closing the menu
+    (
+      case $c in
+        1) cmd_add ;;
+        2) cmd_edit ;;
+        3) cmd_del ;;
+        4) menu_tunnel_ctl ;;
+        5) cmd_peer ;;
+        6) cmd_health ;;
+        7) menu_qos ;;
+        8) menu_bench ;;
+        9) cmd_telegram ;;
+        10) cmd_optimize ;;
+        11) install_fec ;;
+        12) install_rathole ;;
+        *) warn "unknown choice" ;;
+      esac
+    )
+    echo; read -rp "Press Enter to return to the menu..." _
   done
 }
 
