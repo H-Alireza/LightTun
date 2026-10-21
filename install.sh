@@ -28,12 +28,28 @@ if command -v fuser >/dev/null && lock_busy; then
   echo "[*] another apt process is running (usually automatic updates) - waiting for it, up to 15 min"
   for _ in $(seq 180); do lock_busy || break; sleep 5; done
 fi
-APT=(apt-get -o DPkg::Lock::Timeout=600 -y -qq)
+APT=(apt-get -o DPkg::Lock::Timeout=600 -o Acquire::http::Timeout=15 -o Acquire::Retries=1 -y -qq)
+
+PKGS=(iproute2 iptables iputils-ping iperf3 curl ca-certificates conntrack python3 unzip tar kmod ethtool irqbalance)
+
+# Iranian servers often can't reach the default Ubuntu mirrors; fall back to Iranian mirrors for this
+# install only (a temporary sources list, the server's apt config is left untouched)
+apt_install() {
+  "${APT[@]}" update >/dev/null 2>&1; "${APT[@]}" install "$@" >/dev/null 2>&1 && return 0
+  echo "[!] default Ubuntu mirrors failed - retrying through an Iranian mirror (this install only)"
+  local m list=/tmp/lighttun-apt.list o
+  for m in http://mirror.arvancloud.ir/ubuntu http://ir.archive.ubuntu.com/ubuntu http://mirror.iranserver.com/ubuntu; do
+    printf 'deb %s %s main universe\ndeb %s %s-updates main universe\n' "$m" "$VERSION_CODENAME" "$m" "$VERSION_CODENAME" > "$list"
+    o=(-o Dir::Etc::sourcelist="$list" -o Dir::Etc::sourceparts=/nonexistent)
+    if "${APT[@]}" "${o[@]}" update >/dev/null 2>&1 && "${APT[@]}" "${o[@]}" install "$@" >/dev/null 2>&1; then
+      rm -f "$list"; echo "[+] packages installed from $m"; return 0
+    fi
+  done
+  rm -f "$list"; return 1
+}
 
 echo "[*] installing packages"
-"${APT[@]}" update
-"${APT[@]}" install iproute2 iptables iputils-ping iperf3 curl ca-certificates conntrack python3 \
-  unzip tar kmod ethtool irqbalance >/dev/null
+apt_install "${PKGS[@]}" || { echo "[x] could not install packages: ${PKGS[*]}"; exit 1; }
 
 src=""
 if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then

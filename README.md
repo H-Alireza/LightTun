@@ -76,7 +76,18 @@ lighttun bench serve <IP of A>
 lighttun bench run <IP of B>
 ```
 
-The benchmark creates temporary GRE, IPIP, VXLAN, FOU and FEC tunnels (FEC only if installed). On each one it measures:
+The benchmark creates temporary GRE, IPIP, VXLAN and FOU tunnels, plus these FEC and reverse variants:
+
+- `fec`: FEC over plain UDP
+- `fecraw`: FEC disguised as TCP (udp2raw)
+- `fecrev`: the same, but the abroad server opens the connection (reverse)
+- `fecicmp`: FEC disguised as ping
+- `rathole`: reverse TCP tunnel, opened by the abroad server
+
+The FEC variants need `install fec` and rathole needs `install rathole`.
+A type that connects but loses more than half its packets is reported as **BLOCKED** and skipped right away, which is common on filtered Iranian routes.
+
+On each type that works, it measures:
 
 - ping and jitter
 - loss and jitter on a game-like UDP stream
@@ -84,7 +95,7 @@ The benchmark creates temporary GRE, IPIP, VXLAN, FOU and FEC tunnels (FEC only 
 - upload and download speed
 - CPU use
 
-Then it ranks the tunnels with a **gaming score** and a **bulk score**, and removes everything when it's done. It takes about 30 seconds per tunnel type.
+Then it ranks the tunnels with a **gaming score** and a **bulk score**, and removes everything when it's done. A full run takes about 2-3 minutes.
 
 ## Health monitor and alerts
 
