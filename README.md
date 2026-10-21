@@ -121,7 +121,7 @@ On each type that works, it measures:
 - loss and jitter on a game-like UDP stream
 - ping while a TCP transfer is running (bufferbloat)
 - upload and download speed
-- CPU use
+- CPU use, also per Gbit/s moved (CPU/G), so a slow tunnel does not look cheap
 - the largest packet that really passes through the tunnel (MTU column), so you can set `--mtu`
 
 Then it ranks the tunnels with a **gaming score** and a **bulk score**, and removes everything when it's done. A full run takes about 2-3 minutes.

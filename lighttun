@@ -1166,6 +1166,7 @@ for i in range(n):
 print("%.0f %.3f %.3f"%(100*(n-len(rt))/n,statistics.mean(rt),statistics.pstdev(rt)) if rt else "100 - -")' "$@"
 }
 
+cpu_pct() { awk -v b1="$1" -v t1="$2" -v b2="$3" -v t2="$4" 'BEGIN{d=t2-t1; printf "%.1f", (d > 0 ? (b2-b1)*100/d : 0)}'; }   # snap1 snap2
 cpu_snap() { awk '/^cpu /{b=$2+$3+$4+$7+$8+$9; print b, b+$5+$6}' /proc/stat; }
 jget() { python3 -c "import json,sys
 try:
@@ -1190,7 +1191,7 @@ cmd_bench() {
       local tmp; tmp=$(mktemp -d); local res=$tmp/results
       local bl bavg; read -r bl bavg _ < <(ping_stats "$peer" 30 0.05)
       info "baseline ping to $peer (no tunnel): ${bavg} ms, loss ${bl}%"
-      local e i t k ip ipf loss rtt jit ujit uloss lrtt up dn cpu c1 c2 pm sz
+      local e i t k ip ipf loss rtt jit ujit uloss lrtt up dn cpu cpd c1 c2 c3 pm sz
       for e in "${BENCH_UP[@]}"; do
         i=${e%%:*} t=${e#*:}; bench_def "$i" "$t" a "$peer"; pm=-
         printf '%s' "${C}[*]${N} $t: "
@@ -1223,12 +1224,13 @@ cmd_bench() {
         read -r -a c2 < <(cpu_snap)
         if is_port_tun; then lrtt=$(awk '{print $2}' "$tmp/lp"); else lrtt=$(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' "$tmp/lp"); fi
         lrtt=${lrtt:--}
-        cpu=$(awk -v b1="${c1[0]}" -v t1="${c1[1]}" -v b2="${c2[0]}" -v t2="${c2[1]}" 'BEGIN{d=t2-t1; printf "%.1f", (d > 0 ? (b2-b1)*100/d : 0)}'); cpu=${cpu:-0}
         "${IP3[@]}" -P 4 -t 5 -R > "$tmp/dn.json" 2>/dev/null
+        read -r -a c3 < <(cpu_snap)
+        cpu=$(cpu_pct "${c1[@]}" "${c2[@]}") cpd=$(cpu_pct "${c2[@]}" "${c3[@]}")
         up=$(jget "$tmp/up.json" "d['end']['sum_received']['bits_per_second']/1e6")
         dn=$(jget "$tmp/dn.json" "d['end']['sum_received']['bits_per_second']/1e6")
         echo "up ${up} / down ${dn} Mbit/s"
-        echo "$t ok $rtt $jit $loss $ujit $uloss $lrtt $up $dn $cpu ${pm:--}" >> "$res"
+        echo "$t ok $rtt $jit $loss $ujit $uloss $lrtt $up $dn $cpu ${pm:--} $cpd" >> "$res"
       done
       bench_score "$bavg" "$res"
       info "finished in ${SECONDS}s"
@@ -1250,7 +1252,8 @@ for line in open(sys.argv[2]):
     if len(p) < 11 or p[1] != 'ok':
         rows.append(dict(t=p[0], ok=False, why=('BLOCKED (%s%% loss)' % p[2]) if p[1] == 'blocked' else 'NO CONNECTION')); continue
     rows.append(dict(t=p[0], ok=True, rtt=f(p[2]), jit=f(p[3]), loss=f(p[4]) or 0, ujit=f(p[5]), uloss=f(p[6]),
-                     lrtt=f(p[7]), up=f(p[8]) or 0, dn=f(p[9]) or 0, cpu=f(p[10]) or 0, mtu=p[11] if len(p) > 11 else '-'))
+                     lrtt=f(p[7]), up=f(p[8]) or 0, dn=f(p[9]) or 0, cpu=f(p[10]) or 0, mtu=p[11] if len(p) > 11 else '-',
+                     cpd=f(p[12]) if len(p) > 12 else None))
 good = [r for r in rows if r['ok'] and (r['up'] + r['dn']) > 0]
 for r in rows:
     if r['ok'] and r not in good: r.update(ok=False, why='NO DATA (connects, but transfers fail)')
@@ -1265,16 +1268,20 @@ if good:
         g = 100 - 2*over - 3*(r['jit'] or 0) - 3*(r['ujit'] or 0) - 8*(r['uloss'] if r['uloss'] is not None else 10) - 8*r['loss'] - 0.3*bloat
         if r['t'] in ('rathole', 'bp', 'bpmux'): g = min(g, 30)   # TCP-based: head-of-line blocking makes it poor for games
         r['g'] = max(0, min(100, g))
-        r['eff'] = r['up'] / max(r['cpu'], 0.5)
+        # CPU cost per Gbit/s moved, over the upload and download tests (raw CPU% says little: a slow tunnel looks cheap)
+        cpd = r['cpd'] if r['cpd'] is not None else r['cpu']
+        r['cpu'] = (r['cpu'] + cpd) / 2
+        r['cpg'] = r['cpu'] * 2000 / max(r['up'] + r['dn'], 1)
+        r['eff'] = 1 / max(r['cpg'], 0.5)
     maxeff = max(r['eff'] for r in good) or 1
     for r in good:
         thr = (r['up'] + r['dn']) / 2
         r['b'] = max(0, min(100, 70*thr/maxthr + 20*r['eff']/maxeff + 10*(1 - min(r['loss'], 10)/10)))
     def s(v, fmt="{:.1f}"): return "-" if v is None else fmt.format(v)
-    print(f"{'TUNNEL':<8} {'RTT':>6} {'JIT':>5} {'LOSS%':>5} {'UDPJIT':>6} {'UDPLOSS':>7} {'LOADED':>7} {'UP Mb':>7} {'DOWN Mb':>8} {'CPU%':>5} {'MTU':>5}   {'GAMING':>6} {'BULK':>5}")
+    print(f"{'TUNNEL':<8} {'RTT':>6} {'JIT':>5} {'LOSS%':>5} {'UDPJIT':>6} {'UDPLOSS':>7} {'LOADED':>7} {'UP Mb':>7} {'DOWN Mb':>8} {'CPU%':>5} {'CPU/G':>5} {'MTU':>5}   {'GAMING':>6} {'BULK':>5}")
     for r in sorted(good, key=lambda r: -r['g']):
         print(f"{r['t']:<8} {s(r['rtt']):>6} {s(r['jit']):>5} {s(r['loss']):>5} {s(r['ujit']):>6} {s(r['uloss']):>7} {s(r['lrtt']):>7} "
-              f"{s(r['up'],'{:.0f}'):>7} {s(r['dn'],'{:.0f}'):>8} {s(r['cpu']):>5} {r['mtu']:>5}   {r['g']:>6.0f} {r['b']:>5.0f}")
+              f"{s(r['up'],'{:.0f}'):>7} {s(r['dn'],'{:.0f}'):>8} {s(r['cpu']):>5} {s(r['cpg'],'{:.0f}'):>5} {r['mtu']:>5}   {r['g']:>6.0f} {r['b']:>5.0f}")
 for r in rows:
     if not r['ok']: print(f"{r['t']:<8} {r['why']}")
 print()
@@ -1288,7 +1295,8 @@ print("Kernel tunnels and wg are opened by the abroad side: create them with --o
 print("fecraw = FEC in fake TCP, fecrev = FEC over UDP opened by the abroad side, fecicmp = FEC disguised as ping,")
 print("rathole / bp / bpmux = reverse TCP port tunnels (BackPack: warm pool, mux), bpkcp = BackPack over UDP+KCP+FEC.")
 print("RTT/JIT ms from 60 pings (port tunnels: UDP echo); UDP* from a game-like stream; LOADED = ping during upload;")
-print("UP/DOWN = TCP Mbit/s (4 streams); CPU% = this server's total CPU during upload; MTU = largest packet that passed.")
+print("UP/DOWN = TCP Mbit/s (4 streams); CPU% = this server's CPU during the transfers;")
+print("CPU/G = CPU% per Gbit/s moved (lower = lighter); MTU = largest packet that passed.")
 PY
 }
 
