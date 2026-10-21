@@ -966,24 +966,26 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 131072
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 262144
+net.ipv4.tcp_max_tw_buckets = 1440000
 net.ipv4.tcp_max_syn_backlog = 32768
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.ip_local_port_range = 10000 65535
-# buffers
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
+# buffers: high ceilings for fast long-distance links (the kernel only grows a socket that needs it);
+# defaults stay at 1 MB because every socket, UDP ones included, starts at the default
+net.core.rmem_max = 268435456
+net.core.wmem_max = 268435456
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 131072 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
+net.core.optmem_max = 65536
+net.ipv4.tcp_rmem = 4096 131072 268435456
+net.ipv4.tcp_wmem = 4096 65536 268435456
 net.ipv4.udp_rmem_min = 16384
 net.ipv4.udp_wmem_min = 16384
-net.core.netdev_max_backlog = 32768
+net.core.netdev_max_backlog = 250000
 net.core.netdev_budget = 600
-net.core.somaxconn = 32768
+net.core.somaxconn = 65536
 # conntrack: big table, game UDP sessions survive pauses
 net.netfilter.nf_conntrack_max = 1048576
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
