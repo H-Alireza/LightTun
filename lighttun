@@ -1,0 +1,1172 @@
+#!/usr/bin/env bash
+# LightTun - lightweight tunnel manager for Ubuntu servers.
+# Kernel tunnels (GRE, IPIP, VXLAN, GRE-over-UDP/FOU), FEC gaming tunnel (tinyfecVPN + udp2raw),
+# reverse TCP port tunnel (rathole), gaming priority QoS, health monitor with failover, and a benchmark.
+set -o pipefail
+
+VERSION="0.1.0"
+REPO="H-Alireza/LightTun"
+BIN=/usr/local/bin/lighttun
+ETC=/etc/lighttun
+TDIR=$ETC/tunnels
+GCONF=$ETC/lighttun.conf
+STATE=/var/lib/lighttun
+OPT=/opt/lighttun
+UNITDIR=/etc/systemd/system
+
+TYPES="gre ipip vxlan fou fec rathole"
+TVARS=(NAME TYPE LOCAL_IP REMOTE_IP ADDR PEER MTU TTL PRIORITY PORT KEY VNI ROLE SECRET FEC FEC_TIMEOUT FEC_MODE RAW FWD_TCP FWD_UDP BACKUP CHECK INTERVAL MAX_LOSS MAX_JITTER)
+
+if [[ -t 1 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' D=$'\e[2m' W=$'\e[1m' N=$'\e[0m'; else R='' G='' Y='' C='' D='' W='' N=''; fi
+info() { echo "${C}[*]${N} $*"; }
+ok()   { echo "${G}[+]${N} $*"; }
+warn() { echo "${Y}[!]${N} $*" >&2; }
+die()  { echo "${R}[x]${N} $*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
+ipt() { iptables -w "$@"; }
+fgt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0>b+0)}'; }
+is_ip() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_cidr() { [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; }
+is_num() { [[ $1 =~ ^[0-9]+$ ]]; }
+rand_secret() { head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+wan_dev() { ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+'; }
+src_ip_for() { ip -4 route get "${1:-1.1.1.1}" 2>/dev/null | grep -oP 'src \K\S+'; }
+
+# ---------------------------------------------------------------- config
+
+load_global() {
+  QOS_WAN="" QOS_BW="" TG_TOKEN="" TG_CHAT="" TG_PROXY="" NODE_NAME="$(hostname)"
+  [[ -f $GCONF ]] && . "$GCONF"
+}
+
+save_global() {
+  mkdir -p "$ETC"
+  {
+    for v in QOS_WAN QOS_BW TG_TOKEN TG_CHAT TG_PROXY NODE_NAME; do printf '%s=%q\n' "$v" "${!v}"; done
+  } > "$GCONF"
+  chmod 600 "$GCONF"
+}
+
+reset_tunnel() { for v in "${TVARS[@]}"; do printf -v "$v" '%s' ''; done; }
+
+tunnel_defaults() {
+  : "${TTL:=255}" "${PRIORITY:=normal}" "${CHECK:=yes}" "${MAX_LOSS:=5}" "${RAW:=no}"
+  if [[ $PRIORITY == gaming ]]; then : "${INTERVAL:=5}" "${MAX_JITTER:=15}"; else : "${INTERVAL:=15}" "${MAX_JITTER:=40}"; fi
+  case $TYPE in
+    gre)   : "${MTU:=1420}" ;;
+    ipip)  : "${MTU:=1440}" ;;
+    vxlan) : "${MTU:=1400}" "${PORT:=4789}" "${VNI:=100}" ;;
+    fou)   : "${MTU:=1400}" "${PORT:=5555}" ;;
+    fec)   : "${MTU:=1300}" "${PORT:=4096}"
+           if [[ $PRIORITY == gaming ]]; then : "${FEC:=2:4}" "${FEC_TIMEOUT:=1}" "${FEC_MODE:=1}"
+           else : "${FEC:=20:10}" "${FEC_TIMEOUT:=8}" "${FEC_MODE:=0}"; fi ;;
+    rathole) : "${PORT:=2333}" ;;
+  esac
+}
+
+load_tunnel() {
+  reset_tunnel
+  [[ -f $TDIR/$1.conf ]] || die "no tunnel named '$1'"
+  . "$TDIR/$1.conf"
+  tunnel_defaults
+}
+
+save_tunnel() {
+  mkdir -p "$TDIR"
+  { for v in "${TVARS[@]}"; do printf '%s=%q\n' "$v" "${!v}"; done; } > "$TDIR/$NAME.conf"
+  chmod 600 "$TDIR/$NAME.conf"
+}
+
+tunnel_names() { local f; for f in "$TDIR"/*.conf; do [[ -e $f ]] && basename "$f" .conf; done; }
+tvar() { ( . "$TDIR/$1.conf" 2>/dev/null; echo "${!2}" ); }   # read one var of another tunnel
+is_l3() { [[ $TYPE != rathole ]]; }
+unit_of() { case $TYPE in fec|rathole) echo "lighttun-proc@$NAME.service" ;; *) echo "lighttun@$NAME.service" ;; esac; }
+tos_of() { case $PRIORITY in gaming) echo 0xb8 ;; bulk) echo 0x20 ;; *) echo 0x00 ;; esac; }   # EF / CS1 / CS0
+dscp_of() { case $PRIORITY in gaming) echo 46 ;; bulk) echo 8 ;; *) echo 0 ;; esac; }
+other_host() { local ip=${1%/*} o; o=${ip##*.}; if (( o % 2 )); then echo "${ip%.*}.$((o + 1))"; else echo "${ip%.*}.$((o - 1))"; fi; }
+
+validate_tunnel() {
+  [[ $NAME =~ ^[a-z0-9][a-z0-9_-]{0,11}$ ]] || die "name must be 1-12 chars: a-z 0-9 _ -"
+  [[ " $TYPES " == *" $TYPE "* ]] || die "type must be one of: $TYPES"
+  [[ $PRIORITY =~ ^(gaming|normal|bulk)$ ]] || die "priority must be gaming, normal or bulk"
+  is_ip "$LOCAL_IP" || die "bad local IP: $LOCAL_IP"
+  is_ip "$REMOTE_IP" || die "bad remote IP: $REMOTE_IP"
+  if is_l3; then
+    is_cidr "$ADDR" || die "bad tunnel address (use x.x.x.x/30): $ADDR"
+    is_ip "$PEER" || die "bad peer tunnel IP: $PEER"
+    is_num "$MTU" || die "bad MTU"
+  fi
+  [[ -z $KEY ]] || is_num "$KEY" || die "GRE key must be a number"
+  case $TYPE in
+    vxlan) is_num "$VNI" || die "VXLAN needs a numeric VNI" ;;
+    fec|rathole)
+      [[ $ROLE =~ ^(server|client)$ ]] || die "$TYPE needs role server or client"
+      [[ -n $SECRET ]] || die "$TYPE needs a secret" ;;
+  esac
+  [[ $TYPE =~ ^(vxlan|fou|fec|rathole)$ ]] && { is_num "$PORT" || die "$TYPE needs a port"; }
+  if [[ $TYPE == fec ]]; then
+    local want=1; [[ $ROLE == client ]] && want=2
+    [[ ${ADDR%/*} == "${ADDR%.*}.$want" ]] || die "fec $ROLE address must end in .$want (e.g. ${ADDR%.*}.$want/24)"
+  fi
+  if [[ $TYPE == rathole ]]; then
+    [[ -n $FWD_TCP$FWD_UDP ]] || die "rathole needs at least one TCP or UDP port to carry"
+    [[ "$FWD_TCP $FWD_UDP" != *:* ]] || die "rathole does not support port ranges"
+  fi
+  [[ -z $BACKUP || -f $TDIR/$BACKUP.conf ]] || die "backup tunnel '$BACKUP' does not exist"
+  [[ $BACKUP != "$NAME" ]] || die "a tunnel cannot be its own backup"
+  # interface name must not collide with a non-LightTun interface
+  if [[ ! -f $TDIR/$NAME.conf ]] && ip link show "$NAME" &>/dev/null; then die "interface '$NAME' already exists on this system"; fi
+  # GRE-family (gre/fou) tunnels to the same remote need distinct keys; IPIP cannot be doubled
+  local n t
+  for n in $(tunnel_names); do
+    [[ $n == "$NAME" ]] && continue
+    [[ $(tvar "$n" REMOTE_IP) == "$REMOTE_IP" && $(tvar "$n" LOCAL_IP) == "$LOCAL_IP" ]] || continue
+    t=$(tvar "$n" TYPE)
+    if [[ $TYPE =~ ^(gre|fou)$ && $t =~ ^(gre|fou)$ && $(tvar "$n" KEY) == "$KEY" ]]; then
+      die "tunnel '$n' already uses GRE to $REMOTE_IP with key '${KEY:-none}' - set a different --key"
+    fi
+    [[ $TYPE == ipip && $t == ipip ]] && die "tunnel '$n' is already IPIP to $REMOTE_IP; use GRE with a key for a second tunnel"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- firewall
+
+HOOKS=("filter INPUT" "filter FORWARD" "nat PREROUTING" "nat POSTROUTING" "mangle FORWARD" "mangle OUTPUT" "mangle POSTROUTING" "raw PREROUTING" "raw OUTPUT")
+chain_name() { echo "LT_${1}_${2:0:4}"; }
+
+fw_chain() {   # table hook tunnel -> creates/flushes the tunnel's chain, hooks it in, prints its name
+  local t=$1 h=$2 c; c=$(chain_name "$3" "$h")
+  ipt -t "$t" -N "$c" 2>/dev/null || ipt -t "$t" -F "$c"
+  ipt -t "$t" -C "$h" -j "$c" 2>/dev/null || ipt -t "$t" -I "$h" 1 -j "$c"
+  echo "$c"
+}
+
+fw_clear() {
+  local th t h c
+  for th in "${HOOKS[@]}"; do
+    read -r t h <<<"$th"; c=$(chain_name "$1" "$h")
+    while ipt -t "$t" -D "$h" -j "$c" 2>/dev/null; do :; done
+    ipt -t "$t" -F "$c" 2>/dev/null; ipt -t "$t" -X "$c" 2>/dev/null
+  done
+  return 0
+}
+
+outer_match() {   # iptables match for this tunnel's outer packets
+  case $TYPE in
+    gre)  echo "-p gre" ;;
+    ipip) echo "-p 4" ;;
+    vxlan|fou) echo "-p udp --dport $PORT" ;;
+  esac
+}
+
+fw_apply() {   # loaded tunnel
+  local c m dscp p
+  fw_clear "$NAME"
+  m=$(outer_match)
+
+  c=$(fw_chain filter INPUT "$NAME")
+  [[ -n $m ]] && ipt -A "$c" -s "$REMOTE_IP" $m -j ACCEPT
+  case $TYPE in
+    fec)
+      ipt -A "$c" -s "$REMOTE_IP" -p udp -m multiport --ports "$PORT" -j ACCEPT
+      ipt -A "$c" -s "$REMOTE_IP" -p tcp -m multiport --ports "$PORT" -j ACCEPT ;;
+    rathole)
+      if [[ $ROLE == server ]]; then
+        ipt -A "$c" -s "$REMOTE_IP" -p tcp --dport "$PORT" -j ACCEPT
+        for p in $FWD_TCP; do ipt -A "$c" -p tcp --dport "$p" -j ACCEPT; done
+        for p in $FWD_UDP; do ipt -A "$c" -p udp --dport "$p" -j ACCEPT; done
+      fi ;;
+  esac
+  is_l3 && ipt -A "$c" -i "$NAME" -j ACCEPT
+
+  if is_l3; then
+    c=$(fw_chain filter FORWARD "$NAME")
+    ipt -A "$c" -i "$NAME" -j ACCEPT
+    ipt -A "$c" -o "$NAME" -j ACCEPT
+    # MSS clamping: keeps big TCP transfers from stalling on the smaller tunnel MTU
+    for h in FORWARD OUTPUT; do
+      c=$(fw_chain mangle "$h" "$NAME")
+      ipt -t mangle -A "$c" -o "$NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    done
+  fi
+
+  # skip conntrack for kernel tunnels' outer packets (saves CPU under heavy traffic)
+  if [[ -n $m ]]; then
+    c=$(fw_chain raw PREROUTING "$NAME"); ipt -t raw -A "$c" -s "$REMOTE_IP" $m -j CT --notrack
+    c=$(fw_chain raw OUTPUT "$NAME");     ipt -t raw -A "$c" -d "$REMOTE_IP" $m -j CT --notrack
+  fi
+
+  # userspace tunnels: priority mark on outer packets (kernel tunnels set it with "tos" on the link)
+  dscp=$(dscp_of)
+  if [[ $TYPE =~ ^(fec|rathole)$ && $dscp != 0 ]]; then
+    c=$(fw_chain mangle POSTROUTING "$NAME")
+    for p in udp tcp; do ipt -t mangle -A "$c" -d "$REMOTE_IP" -p $p -m multiport --ports "$PORT" -j DSCP --set-dscp "$dscp"; done
+  fi
+
+  [[ $TYPE != rathole ]] && fw_forward "$NAME"
+  return 0
+}
+
+# DNAT this tunnel's forwarded ports to the peer of tunnel $1 (itself, or its backup during failover)
+fw_forward() {
+  local via=$1 peer dev c p
+  [[ -n $FWD_TCP$FWD_UDP ]] || return 0
+  if [[ $via == "$NAME" ]]; then peer=$PEER; else peer=$(tvar "$via" PEER); fi
+  dev=$via
+  c=$(fw_chain nat PREROUTING "$NAME")
+  for p in $FWD_TCP; do ipt -t nat -A "$c" ! -i "$dev" -m addrtype --dst-type LOCAL -p tcp --dport "$p" -j DNAT --to-destination "$peer"; done
+  for p in $FWD_UDP; do ipt -t nat -A "$c" ! -i "$dev" -m addrtype --dst-type LOCAL -p udp --dport "$p" -j DNAT --to-destination "$peer"; done
+  c=$(fw_chain nat POSTROUTING "$NAME")
+  ipt -t nat -A "$c" -o "$dev" -d "$peer" -j MASQUERADE
+  echo "$via" > "$STATE/$NAME.via" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- link setup
+
+fou_port_in_use() {   # another active fou tunnel uses this port?
+  local n
+  for n in $(tunnel_names); do
+    [[ $n != "$NAME" && $(tvar "$n" TYPE) == fou && $(tvar "$n" PORT) == "$PORT" ]] && ip link show "$n" &>/dev/null && return 0
+  done
+  return 1
+}
+
+link_up() {   # kernel tunnel types
+  local tos; tos=$(tos_of)
+  ip link del "$NAME" 2>/dev/null
+  case $TYPE in
+    gre)   modprobe ip_gre 2>/dev/null
+           ip link add "$NAME" type gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl "$TTL" tos "$tos" ${KEY:+key $KEY} ;;
+    ipip)  modprobe ipip 2>/dev/null
+           ip link add "$NAME" type ipip local "$LOCAL_IP" remote "$REMOTE_IP" ttl "$TTL" tos "$tos" ;;
+    vxlan) modprobe vxlan 2>/dev/null
+           ip link add "$NAME" type vxlan id "$VNI" local "$LOCAL_IP" remote "$REMOTE_IP" dstport "$PORT" ttl "$TTL" tos "$tos" ;;
+    fou)   modprobe fou 2>/dev/null; modprobe ip_gre 2>/dev/null
+           ip fou add port "$PORT" ipproto 47 2>/dev/null
+           ip link add "$NAME" type gre local "$LOCAL_IP" remote "$REMOTE_IP" ttl "$TTL" tos "$tos" ${KEY:+key $KEY} \
+             encap fou encap-sport auto encap-dport "$PORT" ;;
+    *) return 1 ;;
+  esac || return 1
+  ip addr add "$ADDR" dev "$NAME" || return 1
+  ip link set "$NAME" mtu "$MTU" up
+}
+
+link_down() {
+  ip link del "$NAME" 2>/dev/null
+  [[ $TYPE == fou ]] && ! fou_port_in_use && ip fou del port "$PORT" 2>/dev/null
+  return 0
+}
+
+fec_run() {   # foreground: tinyfecVPN (+ udp2raw in front when RAW=yes)
+  local sub="${ADDR%.*}.0" fport=$PORT pids=()
+  [[ -x $OPT/tinyvpn ]] || die "tinyfecVPN missing - run: lighttun install fec"
+  local fec=(-f"$FEC" -k "$SECRET" --sub-net "$sub" --tun-dev "$NAME" --timeout "$FEC_TIMEOUT" --mode "$FEC_MODE" --log-level 3)
+  if [[ $RAW == yes ]]; then
+    [[ -x $OPT/udp2raw ]] || die "udp2raw missing - run: lighttun install fec"
+    fport=$((PORT + 1))
+    if [[ $ROLE == server ]]; then
+      "$OPT/udp2raw" -s -l"0.0.0.0:$PORT" -r"127.0.0.1:$fport" -k "$SECRET" --raw-mode faketcp -a --log-level 3 & pids+=($!)
+    else
+      "$OPT/udp2raw" -c -l"127.0.0.1:$fport" -r"$REMOTE_IP:$PORT" -k "$SECRET" --raw-mode faketcp -a --log-level 3 & pids+=($!)
+    fi
+  fi
+  if [[ $ROLE == server ]]; then
+    local lip=0.0.0.0; [[ $RAW == yes ]] && lip=127.0.0.1
+    "$OPT/tinyvpn" -s -l"$lip:$fport" "${fec[@]}" & pids+=($!)
+  else
+    local rip=$REMOTE_IP; [[ $RAW == yes ]] && rip=127.0.0.1
+    "$OPT/tinyvpn" -c -r"$rip:$fport" "${fec[@]}" --keep-reconnect & pids+=($!)
+  fi
+  trap 'kill "${pids[@]}" 2>/dev/null' EXIT TERM INT
+  wait -n
+  kill "${pids[@]}" 2>/dev/null
+  exit 1
+}
+
+rathole_conf() {
+  local f=$STATE/rathole-$NAME.toml p
+  mkdir -p "$STATE"
+  if [[ $ROLE == server ]]; then
+    { echo "[server]"; echo "bind_addr = \"0.0.0.0:$PORT\""; echo "default_token = \"$SECRET\""
+      echo "[server.transport]"; echo 'type = "tcp"'; echo "[server.transport.tcp]"; echo "nodelay = true"
+      for p in $FWD_TCP; do echo "[server.services.t$p]"; echo "bind_addr = \"0.0.0.0:$p\""; done
+      for p in $FWD_UDP; do echo "[server.services.u$p]"; echo 'type = "udp"'; echo "bind_addr = \"0.0.0.0:$p\""; done
+    } > "$f"
+  else
+    { echo "[client]"; echo "remote_addr = \"$REMOTE_IP:$PORT\""; echo "default_token = \"$SECRET\""
+      echo "[client.transport]"; echo 'type = "tcp"'; echo "[client.transport.tcp]"; echo "nodelay = true"
+      for p in $FWD_TCP; do echo "[client.services.t$p]"; echo "local_addr = \"127.0.0.1:$p\""; done
+      for p in $FWD_UDP; do echo "[client.services.u$p]"; echo 'type = "udp"'; echo "local_addr = \"127.0.0.1:$p\""; done
+    } > "$f"
+  fi
+  chmod 600 "$f"; echo "$f"
+}
+
+# ---------------------------------------------------------------- internal (systemd) commands
+
+cmd__up() {
+  load_tunnel "$1"
+  link_up || die "failed to create $TYPE tunnel $NAME"
+  fw_apply
+}
+
+cmd__down() {
+  load_tunnel "$1"
+  fw_clear "$NAME"
+  rm -f "$STATE/$NAME.via"
+  [[ $TYPE == rathole ]] || link_down
+}
+
+cmd__run() {
+  load_tunnel "$1"
+  case $TYPE in
+    fec) fec_run ;;
+    rathole) [[ -x $OPT/rathole ]] || die "rathole missing - run: lighttun install rathole"
+             exec "$OPT/rathole" "$(rathole_conf)" ;;
+  esac
+}
+
+cmd__post() {
+  load_tunnel "$1"
+  if [[ $TYPE == fec ]]; then
+    local i; for i in $(seq 40); do ip link show "$NAME" &>/dev/null && break; sleep 0.5; done
+    ip link set "$NAME" mtu "$MTU" up 2>/dev/null
+  fi
+  fw_apply
+}
+
+cmd__boot() {
+  local m; for m in tcp_bbr sch_fq sch_cake nf_conntrack ip_gre ipip fou vxlan; do modprobe "$m" 2>/dev/null; done
+  sysctl -q -e -p /etc/sysctl.d/99-lighttun.conf >/dev/null 2>&1
+  local wan; wan=$(wan_dev)
+  # bigger NIC ring buffers where the driver allows it
+  if [[ -n $wan ]] && command -v ethtool >/dev/null; then
+    local rx tx
+    rx=$(ethtool -g "$wan" 2>/dev/null | awk '/maximums/{f=1} f&&/^RX:/{print $2; exit}')
+    tx=$(ethtool -g "$wan" 2>/dev/null | awk '/maximums/{f=1} f&&/^TX:/{print $2; exit}')
+    [[ $rx =~ ^[0-9]+$ ]] && ethtool -G "$wan" rx "$rx" 2>/dev/null
+    [[ $tx =~ ^[0-9]+$ ]] && ethtool -G "$wan" tx "$tx" 2>/dev/null
+  fi
+  for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [[ -w $g ]] && echo performance > "$g" 2>/dev/null; done
+  qos_apply quiet
+  return 0
+}
+
+# ---------------------------------------------------------------- unit control
+
+start_tunnel() {
+  local u; u=$(unit_of)
+  systemctl enable "$u" >/dev/null 2>&1
+  systemctl restart "$u" && ok "tunnel $NAME is up ($u)" || { warn "failed to start $NAME - see: journalctl -u $u -n 30"; return 1; }
+}
+
+stop_tunnel() {   # loaded tunnel
+  local u; u=$(unit_of)
+  systemctl disable --now "$u" >/dev/null 2>&1
+  return 0
+}
+
+# ---------------------------------------------------------------- user commands
+
+ask() {   # prompt default -> answer
+  local a; read -rp "$1 ${D}[${2}]${N}: " a; echo "${a:-$2}"
+}
+
+pick_tunnel() {
+  local names=($(tunnel_names)) i a
+  [[ ${#names[@]} -gt 0 ]] || die "no tunnels yet"
+  for i in "${!names[@]}"; do echo "  $((i + 1))) ${names[$i]}" >&2; done
+  read -rp "Tunnel number or name: " a
+  [[ $a =~ ^[0-9]+$ ]] && a=${names[$((a - 1))]}
+  [[ -f $TDIR/$a.conf ]] || die "no tunnel '$a'"
+  echo "$a"
+}
+
+next_free_net() {
+  local i used
+  used=$(cat "$TDIR"/*.conf 2>/dev/null | grep -oP '^ADDR=\K[0-9.]+')
+  for i in $(seq 10 250); do grep -q "^10\.77\.$i\." <<<"$used" || { echo "10.77.$i"; return; }; done
+  echo "10.78.1"
+}
+
+wizard() {   # fills tunnel vars interactively; current values are the defaults
+  local editing=$1 t
+  if [[ -z $editing ]]; then
+    NAME=$(ask "Tunnel name (a-z0-9, max 12)" "tun$(( $(tunnel_names | wc -l) + 1 ))")
+    echo "Tunnel type:"
+    echo "  1) gre      kernel, lowest CPU, best default"
+    echo "  2) ipip     kernel, smallest overhead (one per server pair)"
+    echo "  3) vxlan    kernel, over UDP - when GRE is blocked"
+    echo "  4) fou      kernel, GRE inside UDP - UDP-friendly, almost GRE cost"
+    echo "  5) fec      tinyfecVPN - error correction for lossy routes (gaming)"
+    echo "  6) rathole  reverse TCP/UDP port tunnel - when the far side can't accept connections"
+    t=$(ask "Choose 1-6" "1")
+    TYPE=$(echo $TYPES | cut -d' ' -f"$t")
+    [[ -n $TYPE ]] || die "bad choice"
+  fi
+  PRIORITY=$(ask "Priority: gaming / normal / bulk" "${PRIORITY:-normal}")
+  LOCAL_IP=$(ask "This server's public IP" "${LOCAL_IP:-$(src_ip_for)}")
+  REMOTE_IP=$(ask "Other server's public IP" "$REMOTE_IP")
+  if [[ $TYPE == fec || $TYPE == rathole ]]; then
+    ROLE=$(ask "Role on this server: server (listens) / client (connects out)" "${ROLE:-server}")
+  fi
+  case $TYPE in
+    fec)
+      local net=${ADDR%.*}; [[ -n $ADDR ]] || net=$(next_free_net)
+      net=$(ask "Tunnel /24 network (server gets .1, client .2)" "$net")
+      if [[ $ROLE == server ]]; then ADDR=$net.1/24 PEER=$net.2; else ADDR=$net.2/24 PEER=$net.1; fi ;;
+    rathole) ;;
+    *)
+      ADDR=$(ask "This side's tunnel address" "${ADDR:-$(next_free_net).1/30}")
+      PEER=$(ask "Other side's tunnel IP" "${PEER:-$(other_host "$ADDR")}") ;;
+  esac
+  local saved_mtu=$MTU; [[ -z $editing ]] && MTU=""
+  tunnel_defaults
+  [[ -n $saved_mtu ]] && MTU=$saved_mtu
+  case $TYPE in
+    gre|fou)
+      local k=$KEY
+      if [[ -z $editing ]]; then
+        local n; for n in $(tunnel_names); do
+          [[ $(tvar "$n" REMOTE_IP) == "$REMOTE_IP" && $(tvar "$n" TYPE) =~ ^(gre|fou)$ ]] && k=$(( RANDOM % 9000 + 1000 ))
+        done
+      fi
+      KEY=$(ask "GRE key (empty = none; needed for a 2nd GRE tunnel to the same server)" "$k") ;;
+    vxlan) VNI=$(ask "VXLAN ID" "$VNI") ;;
+  esac
+  [[ $TYPE =~ ^(vxlan|fou|fec|rathole)$ ]] && PORT=$(ask "UDP/TCP port" "$PORT")
+  if [[ $TYPE == fec || $TYPE == rathole ]]; then SECRET=$(ask "Shared secret (same on both sides)" "${SECRET:-$(rand_secret)}"); fi
+  if [[ $TYPE == fec ]]; then
+    RAW=$(ask "Wrap in udp2raw fake-TCP (if UDP is throttled)? yes/no" "$RAW")
+    FEC=$(ask "FEC ratio data:redundant" "$FEC")
+  fi
+  is_l3 && MTU=$(ask "MTU" "$MTU")
+  if [[ $TYPE == rathole ]]; then
+    FWD_TCP=$(ask "TCP ports to carry (space separated)" "$FWD_TCP")
+    FWD_UDP=$(ask "UDP ports to carry (space separated)" "$FWD_UDP")
+  else
+    echo "${D}Port forwarding: clients connect to this server's ports, traffic goes through the tunnel to the other side.${N}"
+    FWD_TCP=$(ask "TCP ports/ranges to forward (e.g. 443 8080:8090, empty = none)" "$FWD_TCP")
+    FWD_UDP=$(ask "UDP ports/ranges to forward (e.g. 51820)" "$FWD_UDP")
+    if [[ -n $FWD_TCP$FWD_UDP ]]; then BACKUP=$(ask "Backup tunnel for automatic failover (empty = none)" "$BACKUP"); fi
+  fi
+}
+
+declare -A FLAGS=([name]=NAME [type]=TYPE [local]=LOCAL_IP [remote]=REMOTE_IP [addr]=ADDR [peer]=PEER [mtu]=MTU [ttl]=TTL
+  [priority]=PRIORITY [port]=PORT [key]=KEY [vni]=VNI [role]=ROLE [secret]=SECRET [fec]=FEC [fec-timeout]=FEC_TIMEOUT
+  [fec-mode]=FEC_MODE [raw]=RAW [tcp]=FWD_TCP [udp]=FWD_UDP [backup]=BACKUP [check]=CHECK [interval]=INTERVAL
+  [max-loss]=MAX_LOSS [max-jitter]=MAX_JITTER)
+
+parse_flags() {
+  while [[ $# -gt 0 ]]; do
+    local k=${1#--} v
+    [[ $k == *=* ]] && { v=${k#*=}; k=${k%%=*}; } || { v=$2; shift; }
+    [[ -n ${FLAGS[$k]} ]] || die "unknown option --$k"
+    printf -v "${FLAGS[$k]}" '%s' "$v"
+    shift
+  done
+}
+
+cmd_add() {
+  need_root; reset_tunnel
+  if [[ $# -gt 0 ]]; then parse_flags "$@"; else wizard ""; fi
+  [[ $TYPE == fec && -z $ADDR && -n $ROLE ]] && die "fec needs --addr (server x.x.x.1/24, client x.x.x.2/24)"
+  [[ -z $PEER && -n $ADDR && $TYPE != fec ]] && PEER=$(other_host "$ADDR")
+  [[ -f $TDIR/$NAME.conf ]] && die "tunnel '$NAME' already exists (use edit)"
+  tunnel_defaults; validate_tunnel
+  [[ $TYPE == fec && ! -x $OPT/tinyvpn ]] && install_fec
+  [[ $TYPE == rathole && ! -x $OPT/rathole ]] && install_rathole
+  save_tunnel
+  start_tunnel
+  echo; info "Run this on the other server ($REMOTE_IP):"; echo; peer_cmd; echo
+}
+
+cmd_edit() {
+  need_root
+  local n=${1:-$(pick_tunnel)}; shift
+  load_tunnel "$n"
+  local old_unit; old_unit=$(unit_of)
+  if [[ $# -gt 0 ]]; then parse_flags "$@"; else wizard edit; fi
+  NAME=$n; tunnel_defaults; validate_tunnel
+  systemctl disable --now "$old_unit" >/dev/null 2>&1   # stops with the old config still on disk
+  save_tunnel
+  start_tunnel
+}
+
+cmd_del() {
+  need_root
+  local n=${1:-$(pick_tunnel)} a
+  load_tunnel "$n"
+  if [[ $2 != -y ]]; then read -rp "Delete tunnel $n ($TYPE to $REMOTE_IP)? [y/N]: " a; [[ $a =~ ^[yY] ]] || return; fi
+  stop_tunnel
+  rm -f "$TDIR/$n.conf" "$STATE/$n".* "$STATE/rathole-$n.toml"
+  ok "deleted $n"
+}
+
+peer_cmd() {   # loaded tunnel -> matching add command for the other server
+  local prefix=${ADDR#*/} role=""
+  [[ $ROLE == server ]] && role=client; [[ $ROLE == client ]] && role=server
+  local s="lighttun add --name $NAME --type $TYPE --local $REMOTE_IP --remote $LOCAL_IP --priority $PRIORITY"
+  is_l3 && s+=" --addr $PEER/$prefix --peer ${ADDR%/*} --mtu $MTU"
+  [[ -n $KEY ]] && s+=" --key $KEY"
+  [[ $TYPE == vxlan ]] && s+=" --vni $VNI"
+  [[ $TYPE =~ ^(vxlan|fou|fec|rathole)$ ]] && s+=" --port $PORT"
+  [[ -n $role ]] && s+=" --role $role --secret $SECRET"
+  [[ $TYPE == fec ]] && s+=" --raw $RAW --fec $FEC"
+  [[ $TYPE == rathole && -n $FWD_TCP ]] && s+=" --tcp '$FWD_TCP'"
+  [[ $TYPE == rathole && -n $FWD_UDP ]] && s+=" --udp '$FWD_UDP'"
+  echo "  $s"
+}
+
+cmd_peer() { local n=${1:-$(pick_tunnel)}; load_tunnel "$n"; peer_cmd; }
+
+cmd_set() {   # lighttun set NAME KEY=VAL ...
+  need_root
+  local n=$1; shift; load_tunnel "$n"
+  local old_unit kv k; old_unit=$(unit_of)
+  for kv in "$@"; do
+    k=${kv%%=*}; [[ " ${TVARS[*]} " == *" $k "* && $k != NAME ]] || die "unknown setting $k (valid: ${TVARS[*]})"
+    printf -v "$k" '%s' "${kv#*=}"
+  done
+  tunnel_defaults; validate_tunnel
+  systemctl disable --now "$old_unit" >/dev/null 2>&1
+  save_tunnel; start_tunnel
+}
+
+for_tunnels() {   # action name|all
+  local act=$1 n names; [[ -z $2 || $2 == all ]] && names=$(tunnel_names) || names=$2
+  for n in $names; do
+    load_tunnel "$n"
+    case $act in
+      up|restart) start_tunnel ;;
+      down) stop_tunnel; ok "$n stopped" ;;
+    esac
+  done
+}
+
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "$1"; }
+
+cmd_list() {
+  local n
+  printf "${W}%-12s %-8s %-7s %-16s %-20s %s${N}\n" NAME TYPE PRIO REMOTE "TUNNEL IP -> PEER" FORWARDS
+  for n in $(tunnel_names); do
+    load_tunnel "$n"
+    local fw=""; [[ -n $FWD_TCP ]] && fw+="tcp:$FWD_TCP "; [[ -n $FWD_UDP ]] && fw+="udp:$FWD_UDP"
+    printf "%-12s %-8s %-7s %-16s %-20s %s\n" "$NAME" "$TYPE" "$PRIORITY" "$REMOTE_IP" "${ADDR%/*} -> ${PEER:--}" "${fw:--}"
+  done
+}
+
+cmd_status() {
+  local n
+  printf "${W}%-12s %-8s %-7s %-9s %-8s %-8s %-6s %-9s %-9s %s${N}\n" NAME TYPE PRIO STATE RTT JITTER LOSS RX TX ROUTE
+  for n in $(tunnel_names); do
+    load_tunnel "$n"
+    local st="-" rtt="-" jit="-" loss="-" rx=0 tx=0 via=""
+    systemctl is-active -q "$(unit_of)" || st="stopped"
+    if [[ -f $STATE/$n.state ]]; then
+      local S_STATUS S_RTT S_JIT S_LOSS S_TS; . "$STATE/$n.state"
+      if [[ $st != stopped ]] && (( $(date +%s) - S_TS < INTERVAL * 4 + 30 )); then st=$S_STATUS rtt=$S_RTT jit=$S_JIT loss=$S_LOSS; fi
+    fi
+    [[ $st == "-" ]] && st=active
+    rx=$(cat "/sys/class/net/$n/statistics/rx_bytes" 2>/dev/null); tx=$(cat "/sys/class/net/$n/statistics/tx_bytes" 2>/dev/null)
+    [[ -f $STATE/$n.via ]] && via=$(cat "$STATE/$n.via"); [[ $via == "$n" ]] && via=""
+    local col=$G; [[ $st == degraded ]] && col=$Y; [[ $st =~ ^(down|stopped)$ ]] && col=$R
+    printf "%-12s %-8s %-7s ${col}%-9s${N} %-8s %-8s %-6s %-9s %-9s %s\n" "$n" "$TYPE" "$PRIORITY" "$st" "$rtt" "$jit" "${loss}%" \
+      "$(human "$rx")" "$(human "$tx")" "${via:+failover->$via}"
+  done
+  load_global
+  [[ -n $QOS_WAN ]] && echo "${D}QoS: cake on $QOS_WAN at $QOS_BW (gaming tunnels first)${N}" || echo "${D}QoS: off (lighttun qos on)${N}"
+}
+
+# ---------------------------------------------------------------- health
+
+ping_stats() {   # ip count interval -> "loss avg mdev"
+  local out loss avg mdev
+  out=$(ping -n -q -c "$2" -i "$3" -W 1 "$1" 2>/dev/null)
+  loss=$(grep -oP '[\d.]+(?=% packet loss)' <<<"$out")
+  read -r avg mdev < <(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/[0-9.]*/\([0-9.]*\) ms.*#\1 \2#p' <<<"$out")
+  echo "${loss:-100} ${avg:--} ${mdev:--}"
+}
+
+check_tunnel() {   # loaded tunnel -> sets H_STATUS H_RTT H_JIT H_LOSS
+  H_RTT="-" H_JIT="-" H_LOSS=0
+  if [[ $TYPE == rathole ]]; then
+    systemctl is-active -q "$(unit_of)" && H_STATUS=up || { H_STATUS=down; H_LOSS=100; }
+    return
+  fi
+  read -r H_LOSS H_RTT H_JIT < <(ping_stats "$PEER" 5 0.2)
+  if [[ ${H_LOSS%.*} -ge 100 ]]; then H_STATUS=down
+  elif fgt "$H_LOSS" "$MAX_LOSS" || fgt "$H_JIT" "$MAX_JITTER"; then H_STATUS=degraded
+  else H_STATUS=up; fi
+}
+
+write_state() { printf 'S_STATUS=%s\nS_RTT=%s\nS_JIT=%s\nS_LOSS=%s\nS_TS=%s\n' "$H_STATUS" "$H_RTT" "$H_JIT" "${H_LOSS%.*}" "$(date +%s)" > "$STATE/$NAME.state"; }
+
+notify() {
+  echo "$*"
+  [[ -n $TG_TOKEN && -n $TG_CHAT ]] || return 0
+  local px=(); [[ -n $TG_PROXY ]] && px=(-x "$TG_PROXY")
+  curl -s -m 10 "${px[@]}" -d chat_id="$TG_CHAT" --data-urlencode text="LightTun [$NODE_NAME] $*" \
+    "https://api.telegram.org/bot$TG_TOKEN/sendMessage" >/dev/null 2>&1 &
+}
+
+switch_route() {   # tunnel target
+  local old new
+  old=$(cat "$STATE/$NAME.via" 2>/dev/null || echo "$NAME")
+  fw_forward "$2"
+  # drop flows still pinned to the old path so clients reconnect through the new one
+  old=$( [[ $old == "$NAME" ]] && echo "$PEER" || tvar "$old" PEER )
+  command -v conntrack >/dev/null && conntrack -D --reply-src "$old" >/dev/null 2>&1
+}
+
+cmd_monitor() {
+  need_root; mkdir -p "$STATE"
+  declare -A next fails bad good last_restart last_status
+  local n now
+  info "LightTun monitor started"
+  while true; do
+    load_global
+    now=$(date +%s)
+    for n in $(tunnel_names); do
+      (( now < ${next[$n]:-0} )) && continue
+      load_tunnel "$n"
+      next[$n]=$(( now + INTERVAL ))
+      [[ $CHECK == yes ]] || continue
+      systemctl is-enabled -q "$(unit_of)" 2>/dev/null || continue
+      check_tunnel; write_state
+      if [[ $H_STATUS == down ]]; then fails[$n]=$(( ${fails[$n]:-0} + 1 )); else fails[$n]=0; fi
+      if [[ $H_STATUS == up ]]; then bad[$n]=0; good[$n]=$(( ${good[$n]:-0} + 1 )); else bad[$n]=$(( ${bad[$n]:-0} + 1 )); good[$n]=0; fi
+      if [[ $H_STATUS != "${last_status[$n]:-up}" ]]; then
+        notify "$n is $H_STATUS (rtt ${H_RTT}ms jitter ${H_JIT}ms loss ${H_LOSS}%)"
+        last_status[$n]=$H_STATUS
+      fi
+      # restart a dead tunnel, at most once a minute
+      if (( ${fails[$n]} >= 3 && now - ${last_restart[$n]:-0} > 60 )); then
+        notify "$n down for ${fails[$n]} checks - restarting"
+        systemctl restart "$(unit_of)"; last_restart[$n]=$now
+      fi
+      # failover of forwarded ports to the backup tunnel, and back once healthy again
+      if [[ -n $BACKUP && -n $FWD_TCP$FWD_UDP ]]; then
+        local via; via=$(cat "$STATE/$n.via" 2>/dev/null || echo "$n")
+        local bst; bst=$(. "$STATE/$BACKUP.state" 2>/dev/null; echo "$S_STATUS")
+        if [[ $via == "$n" ]] && (( ${bad[$n]} >= 3 )) && [[ $bst == up ]]; then
+          switch_route "$n" "$BACKUP"; notify "$n: ports moved to backup $BACKUP"
+        elif [[ $via != "$n" ]] && (( ${good[$n]} >= 5 )); then
+          switch_route "$n" "$n"; notify "$n: healthy again, ports moved back"
+        fi
+      fi
+    done
+    sleep 1
+  done
+}
+
+cmd_health() {
+  local n
+  printf "${W}%-12s %-9s %-9s %-9s %s${N}\n" NAME STATE RTT_MS JITTER_MS LOSS
+  for n in $(tunnel_names); do
+    load_tunnel "$n"; check_tunnel
+    printf "%-12s %-9s %-9s %-9s %s%%\n" "$n" "$H_STATUS" "$H_RTT" "$H_JIT" "$H_LOSS"
+  done
+}
+
+# ---------------------------------------------------------------- QoS (gaming priority)
+
+qos_apply() {
+  load_global
+  [[ -n $QOS_WAN && -n $QOS_BW ]] || return 0
+  modprobe sch_cake 2>/dev/null
+  if tc qdisc replace dev "$QOS_WAN" root cake bandwidth "$QOS_BW" diffserv4 wash 2>/dev/null; then
+    [[ $1 == quiet ]] || ok "cake on $QOS_WAN at $QOS_BW: gaming=Voice tin, normal=Best effort, bulk=Bulk tin"
+  else
+    warn "cake qdisc not available (try: apt install linux-modules-extra-\$(uname -r)); using fq_codel without priority"
+    tc qdisc replace dev "$QOS_WAN" root fq_codel 2>/dev/null
+  fi
+}
+
+cmd_qos() {
+  need_root; load_global
+  case $1 in
+    on)
+      shift
+      local wan=${QOS_WAN:-$(wan_dev)} bw=$QOS_BW
+      while [[ $# -gt 0 ]]; do case $1 in --wan) wan=$2; shift 2 ;; --bw) bw=$2; shift 2 ;; *) die "unknown option $1" ;; esac; done
+      if [[ -z $bw ]]; then
+        local sp; sp=$(cat "/sys/class/net/$wan/speed" 2>/dev/null)
+        [[ $sp =~ ^[0-9]+$ && $sp -gt 0 && $sp -le 10000 ]] || sp=1000
+        echo "Set this a little (~5%) below your real upload speed so the queue stays on this server and gaming can jump it."
+        bw=$(ask "Upload bandwidth of $wan" "$(( sp * 95 / 100 ))mbit")
+      fi
+      QOS_WAN=$wan QOS_BW=$bw; save_global; qos_apply ;;
+    off)
+      [[ -n $QOS_WAN ]] && tc qdisc del dev "$QOS_WAN" root 2>/dev/null
+      QOS_WAN="" QOS_BW=""; save_global; ok "QoS off" ;;
+    *)
+      [[ -n $QOS_WAN ]] && tc -s qdisc show dev "$QOS_WAN" | head -40 || echo "QoS is off. Enable: lighttun qos on [--wan eth0] [--bw 900mbit]" ;;
+  esac
+}
+
+cmd_telegram() {
+  need_root; load_global
+  TG_TOKEN=$(ask "Bot token (empty = disable)" "$TG_TOKEN")
+  TG_CHAT=$(ask "Chat ID" "$TG_CHAT")
+  TG_PROXY=$(ask "Proxy for Telegram API, e.g. socks5h://127.0.0.1:1080 (needed in Iran)" "$TG_PROXY")
+  NODE_NAME=$(ask "Name of this server in alerts" "$NODE_NAME")
+  save_global
+  notify "test alert - Telegram alerts are working"
+  systemctl restart lighttun-monitor 2>/dev/null
+  ok "saved"
+}
+
+# ---------------------------------------------------------------- install / setup
+
+arch_tag() { case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; armv7l) echo arm ;; *) uname -m ;; esac; }
+
+install_fec() {
+  need_root; mkdir -p "$OPT"
+  local tmp a; tmp=$(mktemp -d); a=$(arch_tag)
+  info "downloading tinyfecVPN and udp2raw"
+  curl -fsSL -o "$tmp/t.tgz" https://github.com/wangyu-/tinyfecVPN/releases/latest/download/tinyvpn_binaries.tar.gz || die "download failed"
+  curl -fsSL -o "$tmp/u.tgz" https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz || die "download failed"
+  tar xzf "$tmp/t.tgz" -C "$tmp" && tar xzf "$tmp/u.tgz" -C "$tmp"
+  local tv ur
+  tv=$(find "$tmp" -type f -name "tinyvpn_$a" | head -1)
+  ur=$(find "$tmp" -type f -name "udp2raw_${a}_hw_aes" | head -1)
+  grep -qw aes /proc/cpuinfo && [[ -n $ur ]] || ur=$(find "$tmp" -type f -name "udp2raw_$a" | head -1)
+  [[ -n $tv && -n $ur ]] || die "no binaries for $(uname -m) in the release"
+  install -m 755 "$tv" "$OPT/tinyvpn"; install -m 755 "$ur" "$OPT/udp2raw"
+  rm -rf -- "$tmp"
+  ok "installed $OPT/tinyvpn and $OPT/udp2raw"
+}
+
+install_rathole() {
+  need_root; mkdir -p "$OPT"
+  local tmp t; tmp=$(mktemp -d)
+  case $(uname -m) in x86_64) t=x86_64-unknown-linux-gnu ;; aarch64) t=aarch64-unknown-linux-musl ;; armv7l) t=armv7-unknown-linux-musleabihf ;; *) die "unsupported arch" ;; esac
+  info "downloading rathole"
+  curl -fsSL -o "$tmp/r.zip" "https://github.com/rapiz1/rathole/releases/latest/download/rathole-$t.zip" || die "download failed"
+  unzip -qo "$tmp/r.zip" -d "$tmp" && install -m 755 "$tmp/rathole" "$OPT/rathole"
+  rm -rf -- "$tmp"
+  ok "installed $OPT/rathole"
+}
+
+write_units() {
+  cat > "$UNITDIR/lighttun-base.service" <<EOF
+[Unit]
+Description=LightTun base (modules, tuning, QoS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN _boot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$UNITDIR/lighttun@.service" <<EOF
+[Unit]
+Description=LightTun kernel tunnel %i
+After=network-online.target lighttun-base.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN _up %i
+ExecStop=$BIN _down %i
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$UNITDIR/lighttun-proc@.service" <<EOF
+[Unit]
+Description=LightTun userspace tunnel %i
+After=network-online.target lighttun-base.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$BIN _run %i
+ExecStartPost=$BIN _post %i
+ExecStopPost=$BIN _down %i
+Restart=always
+RestartSec=3
+Nice=-5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$UNITDIR/lighttun-monitor.service" <<EOF
+[Unit]
+Description=LightTun health monitor
+After=network-online.target lighttun-base.service
+
+[Service]
+Type=simple
+ExecStart=$BIN monitor
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+write_tuning() {
+  cat > /etc/sysctl.d/99-lighttun.conf <<'EOF'
+# LightTun server tuning
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+# TCP: BBR + fq pacing
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 131072
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_tw_buckets = 262144
+net.ipv4.tcp_max_syn_backlog = 32768
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.ip_local_port_range = 10000 65535
+# buffers
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.core.netdev_max_backlog = 32768
+net.core.netdev_budget = 600
+net.core.somaxconn = 32768
+# conntrack: big table, game UDP sessions survive pauses
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 300
+# system
+fs.file-max = 2097152
+fs.nr_open = 2097152
+vm.swappiness = 10
+EOF
+  printf '%s\n' tcp_bbr sch_fq sch_cake nf_conntrack ip_gre ipip fou vxlan > /etc/modules-load.d/lighttun.conf
+  echo "options nf_conntrack hashsize=262144" > /etc/modprobe.d/lighttun.conf
+  printf '* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576\n' > /etc/security/limits.d/lighttun.conf
+  mkdir -p /etc/systemd/system.conf.d
+  printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > /etc/systemd/system.conf.d/lighttun.conf
+}
+
+cmd_optimize() {
+  need_root
+  write_tuning
+  modprobe sch_cake 2>/dev/null || apt-get install -y -qq "linux-modules-extra-$(uname -r)" >/dev/null 2>&1
+  systemctl enable --now irqbalance >/dev/null 2>&1
+  cmd__boot
+  ok "server tuned: BBR, fq, big buffers, conntrack, file limits, NIC rings ($(sysctl -n net.ipv4.tcp_congestion_control))"
+}
+
+cmd_setup() {
+  need_root
+  mkdir -p "$TDIR" "$STATE" "$OPT"
+  [[ -f $GCONF ]] || { load_global; save_global; }
+  write_units
+  cmd_optimize
+  systemctl enable lighttun-base >/dev/null 2>&1
+  systemctl enable --now lighttun-monitor >/dev/null 2>&1
+  ok "LightTun $VERSION ready - run: lighttun"
+}
+
+cmd_uninstall() {
+  need_root
+  local n a
+  read -rp "Remove LightTun and stop all tunnels? [y/N]: " a; [[ $a =~ ^[yY] ]] || return
+  for n in $(tunnel_names); do load_tunnel "$n"; stop_tunnel; done
+  systemctl disable --now lighttun-monitor lighttun-base >/dev/null 2>&1
+  load_global; [[ -n $QOS_WAN ]] && tc qdisc del dev "$QOS_WAN" root 2>/dev/null
+  rm -f "$UNITDIR"/lighttun-base.service "$UNITDIR"/lighttun@.service "$UNITDIR"/lighttun-proc@.service "$UNITDIR"/lighttun-monitor.service
+  rm -f /etc/sysctl.d/99-lighttun.conf /etc/modules-load.d/lighttun.conf /etc/modprobe.d/lighttun.conf \
+        /etc/security/limits.d/lighttun.conf /etc/systemd/system.conf.d/lighttun.conf
+  systemctl daemon-reload
+  rm -rf -- "$OPT" "$STATE"
+  read -rp "Also delete tunnel configs in $ETC? [y/N]: " a; [[ $a =~ ^[yY] ]] && rm -rf -- "$ETC"
+  rm -f "$BIN"
+  ok "LightTun removed"
+}
+
+# ---------------------------------------------------------------- benchmark
+
+BENCH_TYPES=(gre ipip vxlan fou fec fecraw)
+BENCH_PIDS=()
+BENCH_UP=()
+
+bench_def() {   # index type role(a|b) peer_public
+  local i=$1 t=$2 role=$3
+  reset_tunnel
+  NAME="ltb_$t" TYPE=$t LOCAL_IP=$(src_ip_for "$4") REMOTE_IP=$4 PRIORITY=normal TTL=64
+  local net="10.250.$(( i + 1 ))"
+  case $t in
+    gre)   KEY=7001 ;;
+    fou)   KEY=7002 PORT=15555 ;;
+    vxlan) VNI=7003 PORT=14789 ;;
+    fec|fecraw)
+      TYPE=fec SECRET=lighttun-bench FEC=10:5 FEC_TIMEOUT=2 FEC_MODE=1 PORT=$(( 16000 + i * 10 ))
+      [[ $t == fecraw ]] && RAW=yes
+      if [[ $role == b ]]; then ROLE=server ADDR=$net.1/24 PEER=$net.2; else ROLE=client ADDR=$net.2/24 PEER=$net.1; fi ;;
+  esac
+  if [[ $TYPE != fec ]]; then
+    if [[ $role == a ]]; then ADDR=$net.1/30 PEER=$net.2; else ADDR=$net.2/30 PEER=$net.1; fi
+  fi
+  tunnel_defaults
+}
+
+bench_cleanup() {
+  local i t
+  [[ ${#BENCH_PIDS[@]} -gt 0 ]] && kill "${BENCH_PIDS[@]}" 2>/dev/null
+  pkill -f -- "--tun-dev ltb_" 2>/dev/null; pkill -f -- "-k lighttun-bench" 2>/dev/null
+  for i in "${!BENCH_TYPES[@]}"; do
+    t=${BENCH_TYPES[$i]}; bench_def "$i" "$t" a "$BENCH_PEER"
+    fw_clear "$NAME"; ip link del "$NAME" 2>/dev/null
+  done
+  ip fou del port 15555 2>/dev/null
+  return 0
+}
+
+bench_setup() {   # role peer
+  local i t
+  BENCH_PEER=$2
+  trap 'bench_cleanup; exit' INT TERM
+  trap bench_cleanup EXIT
+  for i in "${!BENCH_TYPES[@]}"; do
+    t=${BENCH_TYPES[$i]}
+    if [[ $t == fec* ]]; then
+      [[ -x $OPT/tinyvpn ]] || { warn "skip $t: tinyfecVPN not installed (lighttun install fec)"; continue; }
+      [[ $t == fecraw && ! -x $OPT/udp2raw ]] && continue
+    fi
+    bench_def "$i" "$t" "$1" "$2"
+    if [[ $TYPE == fec ]]; then
+      ( fec_run ) >/dev/null 2>&1 & BENCH_PIDS+=($!)
+      local k; for k in $(seq 30); do ip link show "$NAME" &>/dev/null && break; sleep 0.3; done
+      ip link set "$NAME" mtu "$MTU" up 2>/dev/null
+    else
+      link_up 2>/dev/null || { warn "skip $t: could not create (another tunnel of this kind to this server?)"; continue; }
+    fi
+    fw_apply
+    BENCH_UP+=("$i:$t")
+    if [[ $1 == b ]]; then iperf3 -s -B "${ADDR%/*}" >/dev/null 2>&1 & BENCH_PIDS+=($!); fi
+  done
+  ok "test tunnels: ${BENCH_UP[*]#*:}"
+}
+
+cpu_snap() { awk '/^cpu /{b=$2+$3+$4+$7+$8+$9; print b, b+$5+$6}' /proc/stat; }
+jget() { python3 -c "import json,sys
+try:
+  d=json.load(open(sys.argv[1])); print(round(eval(sys.argv[2]),2))
+except Exception: print('-')" "$1" "$2"; }
+
+cmd_bench() {
+  need_root
+  command -v iperf3 >/dev/null || die "iperf3 missing: apt install iperf3"
+  local mode=$1 peer=$2
+  is_ip "$peer" || die "usage: lighttun bench serve <other-server-ip>   (on server B, first)
+       lighttun bench run <other-server-ip>     (on server A)"
+  case $mode in
+    serve)
+      bench_setup b "$peer"
+      echo; ok "Ready. Now run on the other server:  ${W}lighttun bench run $(src_ip_for "$peer")${N}"
+      info "Waiting (Ctrl+C to stop, auto-stop in 30 min)..."
+      sleep 1800 ;;
+    run)
+      bench_setup a "$peer"
+      local tmp; tmp=$(mktemp -d); local res=$tmp/results
+      info "baseline ping to $peer (no tunnel)"
+      local bl bavg; read -r bl bavg _ < <(ping_stats "$peer" 50 0.05)
+      local e i t
+      for e in "${BENCH_UP[@]}"; do
+        i=${e%%:*} t=${e#*:}; bench_def "$i" "$t" a "$peer"
+        info "testing $t ..."
+        local k reach=no; for k in $(seq 40); do ping -c1 -W1 "$PEER" &>/dev/null && { reach=yes; break; }; sleep 1; done
+        if [[ $reach == no ]]; then warn "$t: no connection (is 'bench serve' running on the other side?)"; echo "$t fail" >> "$res"; continue; fi
+        local loss rtt jit; read -r loss rtt jit < <(ping_stats "$PEER" 100 0.02)
+        iperf3 -c "$PEER" -u -b 2M -l 200 -t 5 -J > "$tmp/u.json" 2>/dev/null
+        local ujit uloss; ujit=$(jget "$tmp/u.json" "d['end']['sum']['jitter_ms']"); uloss=$(jget "$tmp/u.json" "d['end']['sum']['lost_percent']")
+        local c1 c2 lrtt
+        read -r -a c1 < <(cpu_snap)
+        ping -n -q -c 50 -i 0.1 -W 1 "$PEER" > "$tmp/lp" 2>/dev/null &
+        iperf3 -c "$PEER" -P 4 -t 6 -J > "$tmp/up.json" 2>/dev/null
+        wait $!
+        read -r -a c2 < <(cpu_snap)
+        lrtt=$(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' "$tmp/lp"); lrtt=${lrtt:--}
+        local cpu; cpu=$(awk -v b1="${c1[0]}" -v t1="${c1[1]}" -v b2="${c2[0]}" -v t2="${c2[1]}" 'BEGIN{d=t2-t1; printf "%.1f", d>0?(b2-b1)*100/d:0}')
+        iperf3 -c "$PEER" -P 4 -t 6 -R -J > "$tmp/dn.json" 2>/dev/null
+        local up dn
+        up=$(jget "$tmp/up.json" "d['end']['sum_received']['bits_per_second']/1e6")
+        dn=$(jget "$tmp/dn.json" "d['end']['sum_received']['bits_per_second']/1e6")
+        echo "$t ok $rtt $jit $loss $ujit $uloss $lrtt $up $dn $cpu" >> "$res"
+      done
+      bench_score "$bavg" "$res"
+      rm -rf -- "$tmp" ;;
+    *) die "usage: lighttun bench serve|run <other-server-ip>" ;;
+  esac
+}
+
+bench_score() {   # baseline_rtt results_file
+  python3 - "$1" "$2" <<'PY'
+import sys
+def f(x):
+    try: return float(x)
+    except Exception: return None
+base = f(sys.argv[1])
+rows = []
+for line in open(sys.argv[2]):
+    p = line.split()
+    if len(p) < 11 or p[1] != 'ok':
+        rows.append(dict(t=p[0], ok=False)); continue
+    r = dict(t=p[0], ok=True, rtt=f(p[2]), jit=f(p[3]), loss=f(p[4]) or 0, ujit=f(p[5]), uloss=f(p[6]),
+             lrtt=f(p[7]), up=f(p[8]) or 0, dn=f(p[9]) or 0, cpu=f(p[10]) or 0)
+    rows.append(r)
+good = [r for r in rows if r['ok']]
+if not good:
+    print("no tunnel worked"); sys.exit()
+maxthr = max((r['up'] + r['dn']) / 2 for r in good) or 1
+for r in good:
+    over = max(0, r['rtt'] - base) if (base and r['rtt'] is not None) else 0
+    bloat = max(0, r['lrtt'] - r['rtt']) if (r['lrtt'] is not None and r['rtt'] is not None) else 50
+    g = 100 - 2*over - 3*(r['jit'] or 0) - 3*(r['ujit'] or 0) - 8*(r['uloss'] if r['uloss'] is not None else 10) - 8*r['loss'] - 0.3*bloat
+    r['g'] = max(0, min(100, g))
+    thr = (r['up'] + r['dn']) / 2
+    r['eff'] = r['up'] / max(r['cpu'], 0.5)
+maxeff = max(r['eff'] for r in good) or 1
+for r in good:
+    thr = (r['up'] + r['dn']) / 2
+    b = 70*thr/maxthr + 20*r['eff']/maxeff + 10*(1 - min(r['loss'], 10)/10)
+    r['b'] = max(0, min(100, b))
+def s(v, fmt="{:.1f}"): return "-" if v is None else fmt.format(v)
+print()
+print(f"Baseline ping (no tunnel): {s(base)} ms")
+print()
+print(f"{'TUNNEL':<8} {'RTT':>6} {'JIT':>5} {'LOSS%':>5} {'UDPJIT':>6} {'UDPLOSS':>7} {'LOADED':>7} {'UP Mb':>7} {'DOWN Mb':>8} {'CPU%':>5}   {'GAMING':>6} {'BULK':>5}")
+for r in sorted(good, key=lambda r: -r['g']):
+    print(f"{r['t']:<8} {s(r['rtt']):>6} {s(r['jit']):>5} {s(r['loss']):>5} {s(r['ujit']):>6} {s(r['uloss']):>7} {s(r['lrtt']):>7} "
+          f"{s(r['up'],'{:.0f}'):>7} {s(r['dn'],'{:.0f}'):>8} {s(r['cpu']):>5}   {r['g']:>6.0f} {r['b']:>5.0f}")
+for r in rows:
+    if not r['ok']: print(f"{r['t']:<8} FAILED")
+bg = max(good, key=lambda r: r['g']); bb = max(good, key=lambda r: r['b'])
+print()
+print(f"Best for gaming: {bg['t']}  (score {bg['g']:.0f}/100)")
+print(f"Best for bulk/VPN traffic: {bb['t']}  (score {bb['b']:.0f}/100)")
+print("RTT/JIT in ms from 100 pings; UDPJIT/UDPLOSS from a game-like UDP stream; LOADED = ping while a TCP transfer runs;")
+print("UP/DOWN = TCP Mbit/s (4 streams); CPU% = this server's total CPU during upload.")
+PY
+}
+
+# ---------------------------------------------------------------- menu
+
+banner() {
+  echo "${C}${W}  LightTun ${VERSION}${N}  ${D}lightweight tunnels for gaming + bulk traffic${N}"
+  echo
+}
+
+cmd_menu() {
+  need_root
+  local c n
+  while true; do
+    banner
+    cmd_status 2>/dev/null; echo
+    cat <<EOF
+  1) Add tunnel            6) Health check now
+  2) Edit tunnel           7) Gaming priority (QoS)
+  3) Delete tunnel         8) Benchmark tunnels
+  4) Restart tunnel        9) Telegram alerts
+  5) Show command for other server
+ 10) Optimize server      11) Install FEC/udp2raw   12) Install rathole
+  0) Exit
+EOF
+    read -rp "> " c; echo
+    case $c in
+      1) cmd_add ;;
+      2) cmd_edit ;;
+      3) cmd_del ;;
+      4) n=$(pick_tunnel) && for_tunnels restart "$n" ;;
+      5) cmd_peer ;;
+      6) cmd_health ;;
+      7) read -rp "on / off / status: " n; cmd_qos "$n" ;;
+      8) read -rp "serve or run: " n; read -rp "Other server's public IP: " c; cmd_bench "$n" "$c" ;;
+      9) cmd_telegram ;;
+      10) cmd_optimize ;;
+      11) install_fec ;;
+      12) install_rathole ;;
+      0|q) exit 0 ;;
+    esac
+    echo; read -rp "Press Enter to continue..." _; clear
+  done
+}
+
+usage() {
+  cat <<EOF
+LightTun $VERSION
+
+  lighttun                         interactive menu
+  lighttun add [--name N --type gre|ipip|vxlan|fou|fec|rathole --local IP --remote IP --addr CIDR
+               --peer IP --priority gaming|normal|bulk --mtu N --key N --port N --vni N
+               --role server|client --secret S --raw yes|no --fec 2:4 --tcp "443 8080" --udp "51820"
+               --backup TUNNEL]
+  lighttun edit [NAME]             edit interactively (or with the same flags)
+  lighttun set NAME KEY=VALUE...   change settings, e.g. lighttun set fnland MTU=1400 PRIORITY=gaming
+  lighttun del NAME [-y]           delete a tunnel
+  lighttun list | status | health  show tunnels / live state / run checks now
+  lighttun up|down|restart [NAME|all]
+  lighttun peer NAME               print the matching command for the other server
+  lighttun qos on [--wan IF --bw 900mbit] | off | status
+  lighttun bench serve|run IP      benchmark all tunnel types between two servers
+  lighttun telegram                set up Telegram alerts
+  lighttun optimize                apply server tuning
+  lighttun install fec|rathole     install optional userspace tunnels
+  lighttun setup | uninstall
+EOF
+}
+
+main() {
+  local c=$1; shift 2>/dev/null
+  [[ $c =~ ^(-v|--version|version|-h|--help|help)$ ]] || need_root
+  case $c in
+    "") cmd_menu ;;
+    add) cmd_add "$@" ;;
+    edit) cmd_edit "$@" ;;
+    set) cmd_set "$@" ;;
+    del|delete|rm) cmd_del "$@" ;;
+    list|ls) cmd_list ;;
+    status|st) cmd_status ;;
+    health) cmd_health ;;
+    up|down|restart) need_root; for_tunnels "$c" "$1" ;;
+    peer) cmd_peer "$@" ;;
+    qos) cmd_qos "$@" ;;
+    bench) cmd_bench "$@" ;;
+    telegram) cmd_telegram ;;
+    optimize) cmd_optimize ;;
+    install) case $1 in fec) install_fec ;; rathole) install_rathole ;; *) die "install fec|rathole" ;; esac ;;
+    setup) cmd_setup ;;
+    uninstall) cmd_uninstall ;;
+    monitor) cmd_monitor ;;
+    _up|_down|_run|_post) "cmd_$c" "$@" ;;
+    _boot) cmd__boot ;;
+    -v|--version|version) echo "$VERSION" ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
