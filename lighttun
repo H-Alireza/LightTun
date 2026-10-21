@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LightTun - lightweight tunnel manager for Ubuntu servers.
 # Kernel tunnels (GRE, IPIP, VXLAN, GRE-over-UDP/FOU, WireGuard), FEC gaming tunnel (tinyfecVPN + udp2raw),
-# reverse TCP port tunnel (rathole), gaming priority QoS, health monitor with failover, and a benchmark.
+# reverse port tunnels (rathole, BackPack with a warm connection pool / KCP+FEC), gaming priority QoS, health monitor with failover, and a benchmark.
 set -o pipefail
 
 VERSION="0.1.0"
@@ -14,8 +14,8 @@ STATE=/var/lib/lighttun
 OPT=/opt/lighttun
 UNITDIR=/etc/systemd/system
 
-TYPES="gre ipip vxlan fou wg fec rathole"
-TVARS=(NAME TYPE LOCAL_IP REMOTE_IP ADDR PEER MTU TTL PRIORITY PORT KEY VNI ROLE SECRET FEC FEC_TIMEOUT FEC_MODE RAW FWD_TCP FWD_UDP BACKUP CHECK INTERVAL MAX_LOSS MAX_JITTER OPENER)
+TYPES="gre ipip vxlan fou wg fec rathole backpack"
+TVARS=(NAME TYPE LOCAL_IP REMOTE_IP ADDR PEER MTU TTL PRIORITY PORT KEY VNI ROLE SECRET FEC FEC_TIMEOUT FEC_MODE RAW FWD_TCP FWD_UDP BACKUP CHECK INTERVAL MAX_LOSS MAX_JITTER OPENER CARRIER)
 
 if [[ -t 1 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' D=$'\e[2m' W=$'\e[1m' N=$'\e[0m'; else R='' G='' Y='' C='' D='' W='' N=''; fi
 info() { echo "${C}[*]${N} $*"; }
@@ -62,6 +62,7 @@ tunnel_defaults() {
            if [[ $PRIORITY == gaming ]]; then : "${FEC:=2:4}" "${FEC_TIMEOUT:=1}" "${FEC_MODE:=1}"
            else : "${FEC:=20:10}" "${FEC_TIMEOUT:=8}" "${FEC_MODE:=0}"; fi ;;
     rathole) : "${PORT:=2333}" ;;
+    backpack) : "${PORT:=2334}" "${CARRIER:=tcp}" ;;
   esac
 }
 
@@ -80,9 +81,10 @@ save_tunnel() {
 
 tunnel_names() { local f; for f in "$TDIR"/*.conf; do [[ -e $f ]] && basename "$f" .conf; done; }
 tvar() { ( . "$TDIR/$1.conf" 2>/dev/null; echo "${!2}" ); }   # read one var of another tunnel
-is_l3() { [[ $TYPE != rathole ]]; }
+is_port_tun() { [[ $TYPE =~ ^(rathole|backpack)$ ]]; }   # carries listed ports, no tunnel interface
+is_l3() { ! is_port_tun; }
 is_kernel() { [[ $TYPE =~ ^(gre|ipip|vxlan|fou|wg)$ ]]; }
-unit_of() { case $TYPE in fec|rathole) echo "lighttun-proc@$NAME.service" ;; *) echo "lighttun@$NAME.service" ;; esac; }
+unit_of() { case $TYPE in fec|rathole|backpack) echo "lighttun-proc@$NAME.service" ;; *) echo "lighttun@$NAME.service" ;; esac; }
 tos_of() { case $PRIORITY in gaming) echo 0xb8 ;; bulk) echo 0x20 ;; *) echo 0x00 ;; esac; }   # EF / CS1 / CS0
 dscp_of() { case $PRIORITY in gaming) echo 46 ;; bulk) echo 8 ;; *) echo 0 ;; esac; }
 other_host() { local ip=${1%/*} o; o=${ip##*.}; if (( o % 2 )); then echo "${ip%.*}.$((o + 1))"; else echo "${ip%.*}.$((o - 1))"; fi; }
@@ -103,21 +105,23 @@ validate_tunnel() {
     vxlan) is_num "$VNI" || die "VXLAN needs a numeric VNI" ;;
     wg)    [[ -n $SECRET ]] || die "wg needs a secret (both keys are derived from it)"
            command -v wg >/dev/null || die "wg missing: apt install wireguard-tools" ;;
-    fec|rathole)
+    backpack)
+      [[ $CARRIER =~ ^(tcp|tcpmux|kcp)$ ]] || die "backpack carrier must be tcp, tcpmux or kcp" ;;&
+    fec|rathole|backpack)
       [[ $ROLE =~ ^(server|client)$ ]] || die "$TYPE needs role server or client"
       [[ -n $SECRET ]] || die "$TYPE needs a secret" ;;
   esac
-  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole)$ ]] && { is_num "$PORT" || die "$TYPE needs a port"; }
+  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && { is_num "$PORT" || die "$TYPE needs a port"; }
   [[ -z $OPENER || $OPENER =~ ^(me|peer)$ ]] || die "opener must be me, peer or empty"
-  [[ -z $OPENER ]] || is_kernel || die "opener is for kernel tunnels (fec/rathole already have a role)"
+  [[ -z $OPENER ]] || is_kernel || die "opener is for kernel tunnels (fec/rathole/backpack already have a role)"
   [[ $RAW =~ ^(yes|no|icmp)$ ]] || die "raw must be yes (fake TCP), icmp or no"
   if [[ $TYPE == fec ]]; then
     local want=1; [[ $ROLE == client ]] && want=2
     [[ ${ADDR%/*} == "${ADDR%.*}.$want" ]] || die "fec $ROLE address must end in .$want (e.g. ${ADDR%.*}.$want/24)"
   fi
-  if [[ $TYPE == rathole ]]; then
-    [[ -n $FWD_TCP$FWD_UDP ]] || die "rathole needs at least one TCP or UDP port to carry"
-    [[ "$FWD_TCP $FWD_UDP" != *:* ]] || die "rathole does not support port ranges"
+  if is_port_tun; then
+    [[ -n $FWD_TCP$FWD_UDP ]] || die "$TYPE needs at least one TCP or UDP port to carry"
+    [[ "$FWD_TCP $FWD_UDP" != *:* ]] || die "$TYPE does not support port ranges"
   fi
   [[ -z $BACKUP || -f $TDIR/$BACKUP.conf ]] || die "backup tunnel '$BACKUP' does not exist"
   [[ $BACKUP != "$NAME" ]] || die "a tunnel cannot be its own backup"
@@ -183,9 +187,10 @@ fw_apply() {   # loaded tunnel
       ipt -A "$c" -s "$REMOTE_IP" -p udp -m multiport --ports "$PORT" -j ACCEPT
       ipt -A "$c" -s "$REMOTE_IP" -p tcp -m multiport --ports "$PORT" -j ACCEPT
       [[ $RAW == icmp ]] && ipt -A "$c" -s "$REMOTE_IP" -p icmp -j ACCEPT ;;
-    rathole)
+    rathole|backpack)
       if [[ $ROLE == server ]]; then
         ipt -A "$c" -s "$REMOTE_IP" -p tcp --dport "$PORT" -j ACCEPT
+        [[ $CARRIER == kcp ]] && ipt -A "$c" -s "$REMOTE_IP" -p udp --dport "$PORT" -j ACCEPT
         for p in $FWD_TCP; do ipt -A "$c" -p tcp --dport "$p" -j ACCEPT; done
         for p in $FWD_UDP; do ipt -A "$c" -p udp --dport "$p" -j ACCEPT; done
       fi ;;
@@ -201,6 +206,9 @@ fw_apply() {   # loaded tunnel
       c=$(fw_chain mangle "$h" "$NAME")
       ipt -t mangle -A "$c" -o "$NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     done
+    # traffic leaving the tunnel toward clients keeps the tunnel's class, so QoS can put gaming first downstream too
+    dscp=$(dscp_of)
+    [[ $dscp != 0 ]] && ipt -t mangle -A "$(chain_name "$NAME" FORWARD)" -i "$NAME" -j DSCP --set-dscp "$dscp"
   fi
 
   # opener=peer: never send first. Filtered routes (e.g. Iran -> abroad) cut a flow this side starts and keep
@@ -220,12 +228,12 @@ fw_apply() {   # loaded tunnel
 
   # userspace tunnels and wg: priority mark on outer packets (the other kernel tunnels set it with "tos")
   dscp=$(dscp_of)
-  if [[ $TYPE =~ ^(fec|rathole|wg)$ && $dscp != 0 ]]; then
+  if [[ $TYPE =~ ^(fec|rathole|backpack|wg)$ && $dscp != 0 ]]; then
     c=$(fw_chain mangle POSTROUTING "$NAME")
     for p in udp tcp; do ipt -t mangle -A "$c" -d "$REMOTE_IP" -p $p -m multiport --ports "$PORT" -j DSCP --set-dscp "$dscp"; done
   fi
 
-  [[ $TYPE != rathole ]] && fw_forward "$NAME"
+  is_l3 && fw_forward "$NAME"
   return 0
 }
 
@@ -343,6 +351,43 @@ rathole_conf() {
   chmod 600 "$f"; echo "$f"
 }
 
+bp_bin() { [[ -x $OPT/backpack ]] && echo "$OPT/backpack" || command -v backpack; }   # ours, or one already installed
+
+# BackPack engine config. Same idea as rathole (the abroad side dials in, Iran exposes the ports), plus what makes
+# it hold up on filtered routes: a pool of warm connections (no handshake per new user connection), heartbeats,
+# and the kcp carrier (reliable UDP with FEC) for gaming. Tuning = BackPack's "turbo" preset; kcp + bulk priority
+# gets its "throughput" preset. skip_optz: LightTun's own tuning stays in charge of sysctls.
+backpack_conf() {
+  local f=$STATE/backpack-$NAME.toml ports udp=false
+  mkdir -p "$STATE"
+  ports=$(printf '%s\n' $FWD_TCP $FWD_UDP | sort -un | sed 's/.*/"&"/' | paste -sd, -)
+  [[ -n $FWD_UDP ]] && udp=true
+  {
+    if [[ $ROLE == server ]]; then
+      echo "[server]"; echo "bind_addr = \"0.0.0.0:$PORT\""
+      echo "heartbeat = 40"; echo "channel_size = 4096"; echo "mux_con = 8"
+      echo "accept_udp = $udp"; echo "ports = [$ports]"
+    else
+      echo "[client]"; echo "remote_addr = \"$REMOTE_IP:$PORT\""
+      echo "connection_pool = 8"; echo "aggressive_pool = false"; echo "retry_interval = 3"; echo "dial_timeout = 10"
+      [[ $CARRIER == tcpmux ]] && echo "mux_session = 8"
+    fi
+    echo "transport = \"$CARRIER\""; echo "token = \"$SECRET\""
+    echo "nodelay = true"; echo "keepalive_period = 75"; echo 'log_level = "warn"'; echo "skip_optz = true"
+    echo "so_rcvbuf = 8388608"; echo "so_sndbuf = 8388608"
+    echo "mux_version = 2"; echo "mux_framesize = 32768"; echo "mux_recievebuffer = 16777216"; echo "mux_streambuffer = 2097152"
+    if [[ $CARRIER == kcp ]]; then
+      echo "kcp_mtu = 1250"; echo "kcp_resend = 2"; echo "kcp_nodelay = 1"; echo "kcp_nocongestion = 1"; echo "kcp_datashards = 10"
+      if [[ $PRIORITY == bulk ]]; then
+        echo "kcp_interval = 20"; echo "kcp_acknodelay = false"; echo "kcp_sndwnd = 4096"; echo "kcp_rcvwnd = 4096"; echo "kcp_parityshards = 1"
+      else
+        echo "kcp_interval = 10"; echo "kcp_acknodelay = true"; echo "kcp_sndwnd = 1024"; echo "kcp_rcvwnd = 1024"; echo "kcp_parityshards = 3"
+      fi
+    fi
+  } > "$f"
+  chmod 600 "$f"; echo "$f"
+}
+
 # ---------------------------------------------------------------- internal (systemd) commands
 
 cmd__up() {
@@ -361,7 +406,8 @@ cmd__down() {
   systemctl stop --no-block "lighttun-ka@$NAME.service" 2>/dev/null
   fw_clear "$NAME"
   rm -f "$STATE/$NAME.via"
-  [[ $TYPE == rathole ]] || link_down
+  is_l3 && link_down
+  return 0
 }
 
 cmd__run() {
@@ -370,6 +416,8 @@ cmd__run() {
     fec) fec_run ;;
     rathole) [[ -x $OPT/rathole ]] || die "rathole missing - run: lighttun install rathole"
              exec "$OPT/rathole" "$(rathole_conf)" ;;
+    backpack) [[ -n $(bp_bin) ]] || die "BackPack missing - run: lighttun install backpack"
+              exec "$(bp_bin)" -c "$(backpack_conf)" ;;
   esac
 }
 
@@ -403,6 +451,7 @@ cmd__boot() {
 
 start_tunnel() {
   local u; u=$(unit_of)
+  [[ -f $UNITDIR/lighttun-ka@.service ]] || write_units   # units added by an update
   systemctl enable "$u" >/dev/null 2>&1
   systemctl restart "$u" && ok "tunnel $NAME is up ($u)" || { warn "failed to start $NAME - see: journalctl -u $u -n 30"; return 1; }
 }
@@ -448,14 +497,15 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
     echo "  5) wg       kernel WireGuard - encrypted, low CPU, good for gaming"
     echo "  6) fec      tinyfecVPN - error correction for lossy routes (gaming)"
     echo "  7) rathole  reverse TCP/UDP port tunnel - when the far side can't accept connections"
-    t=$(ask "Choose 1-7" "1")
+    echo "  8) backpack reverse port tunnel with a warm connection pool; kcp carrier = UDP+FEC for gaming"
+    t=$(ask "Choose 1-8" "1")
     TYPE=$(echo $TYPES | cut -d' ' -f"$t")
     [[ -n $TYPE ]] || die "bad choice"
   fi
   PRIORITY=$(ask "Priority: gaming / normal / bulk" "${PRIORITY:-normal}")
   LOCAL_IP=$(ask "This server's public IP" "${LOCAL_IP:-$(src_ip_for)}")
   REMOTE_IP=$(ask "Other server's public IP" "$REMOTE_IP")
-  if [[ $TYPE == fec || $TYPE == rathole ]]; then
+  if [[ $TYPE == fec ]] || is_port_tun; then
     ROLE=$(ask "Role on this server: server (listens) / client (connects out)" "${ROLE:-server}")
   fi
   case $TYPE in
@@ -463,7 +513,7 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
       local net=${ADDR%.*}; [[ -n $ADDR ]] || net=$(next_free_net)
       net=$(ask "Tunnel /24 network (server gets .1, client .2)" "$net")
       if [[ $ROLE == server ]]; then ADDR=$net.1/24 PEER=$net.2; else ADDR=$net.2/24 PEER=$net.1; fi ;;
-    rathole) ;;
+    rathole|backpack) ;;
     *)
       ADDR=$(ask "This side's tunnel address" "${ADDR:-$(next_free_net).1/30}")
       PEER=$(ask "Other side's tunnel IP" "${PEER:-$(other_host "$ADDR")}") ;;
@@ -482,8 +532,9 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
       KEY=$(ask "GRE key (empty = none; needed for a 2nd GRE tunnel to the same server)" "$k") ;;
     vxlan) VNI=$(ask "VXLAN ID" "$VNI") ;;
   esac
-  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole)$ ]] && PORT=$(ask "UDP/TCP port" "$PORT")
-  if [[ $TYPE =~ ^(wg|fec|rathole)$ ]]; then SECRET=$(ask "Shared secret (same on both sides)" "${SECRET:-$(rand_secret)}"); fi
+  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && PORT=$(ask "UDP/TCP port" "$PORT")
+  [[ $TYPE == backpack ]] && CARRIER=$(ask "Carrier: tcp / tcpmux (many short connections) / kcp (UDP+FEC, gaming)" "$CARRIER")
+  if [[ $TYPE =~ ^(wg|fec|rathole|backpack)$ ]]; then SECRET=$(ask "Shared secret (same on both sides)" "${SECRET:-$(rand_secret)}"); fi
   if is_kernel; then
     echo "${D}Filtered routes (e.g. Iran -> abroad) cut flows the Iran side starts. Answer 'me' on the abroad server"
     echo "and 'peer' on the Iran server: the abroad side then always opens the tunnel. Empty = off.${N}"
@@ -494,7 +545,7 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
     FEC=$(ask "FEC ratio data:redundant" "$FEC")
   fi
   is_l3 && MTU=$(ask "MTU" "$MTU")
-  if [[ $TYPE == rathole ]]; then
+  if is_port_tun; then
     FWD_TCP=$(ask "TCP ports to carry (space separated)" "$FWD_TCP")
     FWD_UDP=$(ask "UDP ports to carry (space separated)" "$FWD_UDP")
   else
@@ -508,7 +559,7 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
 declare -A FLAGS=([name]=NAME [type]=TYPE [local]=LOCAL_IP [remote]=REMOTE_IP [addr]=ADDR [peer]=PEER [mtu]=MTU [ttl]=TTL
   [priority]=PRIORITY [port]=PORT [key]=KEY [vni]=VNI [role]=ROLE [secret]=SECRET [fec]=FEC [fec-timeout]=FEC_TIMEOUT
   [fec-mode]=FEC_MODE [raw]=RAW [tcp]=FWD_TCP [udp]=FWD_UDP [backup]=BACKUP [check]=CHECK [interval]=INTERVAL
-  [max-loss]=MAX_LOSS [max-jitter]=MAX_JITTER [opener]=OPENER)
+  [max-loss]=MAX_LOSS [max-jitter]=MAX_JITTER [opener]=OPENER [carrier]=CARRIER)
 
 parse_flags() {
   while [[ $# -gt 0 ]]; do
@@ -529,6 +580,7 @@ cmd_add() {
   tunnel_defaults; validate_tunnel
   [[ $TYPE == fec && ! -x $OPT/tinyvpn ]] && install_fec
   [[ $TYPE == rathole && ! -x $OPT/rathole ]] && install_rathole
+  [[ $TYPE == backpack && -z $(bp_bin) ]] && install_backpack
   save_tunnel
   start_tunnel
   echo; info "Run this on the other server ($REMOTE_IP):"; echo; peer_cmd; echo
@@ -552,7 +604,7 @@ cmd_del() {
   load_tunnel "$n"
   if [[ $2 != -y ]]; then read -rp "Delete tunnel $n ($TYPE to $REMOTE_IP)? [y/N]: " a; [[ $a =~ ^[yY] ]] || return; fi
   stop_tunnel
-  rm -f "$TDIR/$n.conf" "$STATE/$n".* "$STATE/rathole-$n.toml"
+  rm -f "$TDIR/$n.conf" "$STATE/$n".* "$STATE/rathole-$n.toml" "$STATE/backpack-$n.toml"
   ok "deleted $n"
 }
 
@@ -563,13 +615,14 @@ peer_cmd() {   # loaded tunnel -> matching add command for the other server
   is_l3 && s+=" --addr $PEER/$prefix --peer ${ADDR%/*} --mtu $MTU"
   [[ -n $KEY ]] && s+=" --key $KEY"
   [[ $TYPE == vxlan ]] && s+=" --vni $VNI"
-  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole)$ ]] && s+=" --port $PORT"
+  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && s+=" --port $PORT"
+  [[ $TYPE == backpack ]] && s+=" --carrier $CARRIER"
   [[ -n $role ]] && s+=" --role $role --secret $SECRET"
   [[ $TYPE == wg ]] && s+=" --secret $SECRET"
   [[ $OPENER == me ]] && s+=" --opener peer"; [[ $OPENER == peer ]] && s+=" --opener me"
   [[ $TYPE == fec ]] && s+=" --raw $RAW --fec $FEC"
-  [[ $TYPE == rathole && -n $FWD_TCP ]] && s+=" --tcp '$FWD_TCP'"
-  [[ $TYPE == rathole && -n $FWD_UDP ]] && s+=" --udp '$FWD_UDP'"
+  is_port_tun && [[ -n $FWD_TCP ]] && s+=" --tcp '$FWD_TCP'"
+  is_port_tun && [[ -n $FWD_UDP ]] && s+=" --udp '$FWD_UDP'"
   echo "  $s"
 }
 
@@ -645,7 +698,7 @@ ping_stats() {   # ip count interval -> "loss avg mdev"
 
 check_tunnel() {   # loaded tunnel -> sets H_STATUS H_RTT H_JIT H_LOSS
   H_RTT="-" H_JIT="-" H_LOSS=0
-  if [[ $TYPE == rathole ]]; then
+  if is_port_tun; then
     systemctl is-active -q "$(unit_of)" && H_STATUS=up || { H_STATUS=down; H_LOSS=100; }
     return
   fi
@@ -802,6 +855,19 @@ install_rathole() {
   unzip -qo "$tmp/r.zip" -d "$tmp" && install -m 755 "$tmp/rathole" "$OPT/rathole"
   rm -rf -- "$tmp"
   ok "installed $OPT/rathole"
+}
+
+install_backpack() {   # github.com/AminMGMT/BackPack (AGPL-3.0), checked against the release's SHA256SUMS
+  need_root; mkdir -p "$OPT"
+  local tmp a u=https://github.com/AminMGMT/BackPack/releases/latest/download; tmp=$(mktemp -d)
+  case $(uname -m) in x86_64) a=amd64 ;; aarch64) a=arm64 ;; armv7l) a=armv7 ;; i?86) a=386 ;; *) die "unsupported arch" ;; esac
+  info "downloading BackPack"
+  curl -fsSL -o "$tmp/backpack_linux_$a.tar.gz" "$u/backpack_linux_$a.tar.gz" && curl -fsSL -o "$tmp/SHA256SUMS" "$u/SHA256SUMS" \
+    || { rm -rf -- "$tmp"; die "download failed"; }
+  ( cd "$tmp" && grep " backpack_linux_$a.tar.gz\$" SHA256SUMS | sha256sum -c --quiet ) || { rm -rf -- "$tmp"; die "checksum mismatch"; }
+  tar xzf "$tmp/backpack_linux_$a.tar.gz" -C "$tmp" backpack && install -m 755 "$tmp/backpack" "$OPT/backpack"
+  rm -rf -- "$tmp"
+  ok "installed $OPT/backpack ($("$OPT/backpack" -v 2>/dev/null | head -1))"
 }
 
 write_units() {
@@ -976,8 +1042,9 @@ cmd_uninstall() {
 # ---------------------------------------------------------------- benchmark
 
 # test types: kernel tunnels (incl. WireGuard), all opened by the serve (abroad) side; FEC over plain UDP /
-# fake TCP / ICMP; fecrev = FEC over plain UDP opened by the serve side; rathole = reverse TCP opened by it too
-BENCH_TYPES=(gre ipip vxlan fou wg fec fecraw fecrev fecicmp rathole)
+# fake TCP / ICMP; fecrev = FEC over plain UDP opened by the serve side; port tunnels opened by the serve side too:
+# rathole, BackPack over tcp (bp), tcp+mux (bpmux) and kcp = UDP with FEC (bpkcp)
+BENCH_TYPES=(gre ipip vxlan fou wg fec fecraw fecrev fecicmp rathole bp bpmux bpkcp)
 BENCH_PIDS=()
 BENCH_UP=()
 BENCH_RT_PORT=15201
@@ -998,8 +1065,11 @@ bench_def() {   # index type role(a|b) peer_public
       [[ $t == fecicmp ]] && RAW=icmp
       local srv=b; [[ $t == fecrev ]] && srv=a
       if [[ $role == "$srv" ]]; then ROLE=server ADDR=$net.1/24 PEER=$net.2; else ROLE=client ADDR=$net.2/24 PEER=$net.1; fi ;;
-    rathole)
-      SECRET=lighttun-bench PORT=15333 FWD_TCP=$BENCH_RT_PORT FWD_UDP=$BENCH_RT_PORT
+    rathole|bp*)
+      # each port tunnel carries its own iperf port and, one above it, a UDP echo port for RTT
+      BENCH_RT_PORT=$(( 15100 + i * 2 ))
+      SECRET=lighttun-bench PORT=$(( 15300 + i )) FWD_TCP=$BENCH_RT_PORT FWD_UDP="$BENCH_RT_PORT $(( BENCH_RT_PORT + 1 ))"
+      case $t in bp) TYPE=backpack CARRIER=tcp ;; bpmux) TYPE=backpack CARRIER=tcpmux ;; bpkcp) TYPE=backpack CARRIER=kcp ;; esac
       if [[ $role == b ]]; then ROLE=client; else ROLE=server; fi ;;
   esac
   if is_kernel; then
@@ -1019,6 +1089,7 @@ bench_cleanup() {
   local i
   [[ ${#BENCH_PIDS[@]} -gt 0 ]] && kill "${BENCH_PIDS[@]}" 2>/dev/null
   pkill -f -- "--tun-dev ltb_" 2>/dev/null; pkill -f -- "-k lighttun-bench" 2>/dev/null; pkill -f -- "rathole-ltb_" 2>/dev/null
+  pkill -f -- "backpack-ltb_" 2>/dev/null; pkill -f -- "lighttun-udp-echo" 2>/dev/null
   sleep 0.5
   for i in "${!BENCH_TYPES[@]}"; do
     bench_def "$i" "${BENCH_TYPES[$i]}" a "$BENCH_PEER"
@@ -1026,7 +1097,7 @@ bench_cleanup() {
     [[ $TYPE == fec ]] && udp2raw_clear "$PORT"
   done
   ip fou del port 15555 2>/dev/null
-  rm -f "$STATE"/rathole-ltb_*.toml
+  rm -f "$STATE"/rathole-ltb_*.toml "$STATE"/backpack-ltb_*.toml
   return 0
 }
 
@@ -1043,12 +1114,14 @@ bench_setup() {   # role peer
       fec*) [[ -x $OPT/tinyvpn ]] || { warn "skip $t: run 'lighttun install fec'"; continue; }
             [[ $t != fec && ! -x $OPT/udp2raw ]] && continue ;;
       rathole) [[ -x $OPT/rathole ]] || { warn "skip rathole: run 'lighttun install rathole'"; continue; } ;;
+      bp*) [[ -n $(bp_bin) ]] || { warn "skip $t: run 'lighttun install backpack'"; continue; } ;;
       wg) command -v wg >/dev/null || { warn "skip wg: apt install wireguard-tools"; continue; } ;;
     esac
     bench_def "$i" "$t" "$1" "$2"
     case $TYPE in
       fec) ( fec_run ) >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
       rathole) "$OPT/rathole" "$(rathole_conf)" >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
+      backpack) "$(bp_bin)" -c "$(backpack_conf)" >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
       *) link_up 2>/dev/null || { warn "skip $t: could not create (another tunnel of this kind to this server?)"; continue; } ;;
     esac
     BENCH_UP+=("$i:$t")
@@ -1063,12 +1136,34 @@ bench_setup() {   # role peer
     # the serve (abroad) side opens kernel tunnels and keeps them open (wg: persistent-keepalive)
     [[ $OPENER == me && $TYPE != wg ]] && { ping -n -q -i 1 -W 1 "$PEER" >/dev/null 2>&1 & BENCH_PIDS+=($!); }
     if [[ $1 == b ]]; then
-      if [[ $TYPE == rathole ]]; then iperf3 -s -B 127.0.0.1 -p "$BENCH_RT_PORT" >/dev/null 2>&1 &
-      else iperf3 -s -B "${ADDR%/*}" >/dev/null 2>&1 & fi
-      BENCH_PIDS+=($!)
+      if is_port_tun; then
+        iperf3 -s -B 127.0.0.1 -p "$BENCH_RT_PORT" >/dev/null 2>&1 & BENCH_PIDS+=($!)
+        udp_echo $(( BENCH_RT_PORT + 1 )) & BENCH_PIDS+=($!)
+      else iperf3 -s -B "${ADDR%/*}" >/dev/null 2>&1 & BENCH_PIDS+=($!); fi
     fi
   done
   ok "test tunnels: ${BENCH_UP[*]#*:}"
+}
+
+udp_echo() {   # port: answers every datagram on 127.0.0.1 (RTT through a port tunnel)
+  exec python3 -c 'import socket,sys  # lighttun-udp-echo
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("127.0.0.1",int(sys.argv[1])))
+while True:
+  d,a=s.recvfrom(2048); s.sendto(d,a)' "$1"
+}
+
+udp_ping() {   # host port count interval -> "loss avg mdev", like ping_stats but through a forwarded UDP port
+  python3 -c 'import socket,sys,time,statistics
+h,p,n,iv=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),float(sys.argv[4])
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(1); rt=[]
+for i in range(n):
+  t=time.time(); m=str(i).encode(); s.sendto(m,(h,p))
+  try:
+    while s.recvfrom(64)[0]!=m: pass
+    rt.append((time.time()-t)*1000)
+  except socket.timeout: pass
+  time.sleep(max(0,iv-(time.time()-t)))
+print("%.0f %.3f %.3f"%(100*(n-len(rt))/n,statistics.mean(rt),statistics.pstdev(rt)) if rt else "100 - -")' "$@"
 }
 
 cpu_snap() { awk '/^cpu /{b=$2+$3+$4+$7+$8+$9; print b, b+$5+$6}' /proc/stat; }
@@ -1099,11 +1194,11 @@ cmd_bench() {
       for e in "${BENCH_UP[@]}"; do
         i=${e%%:*} t=${e#*:}; bench_def "$i" "$t" a "$peer"; pm=-
         printf '%s' "${C}[*]${N} $t: "
-        if [[ $TYPE == rathole ]]; then
+        if is_port_tun; then
           ip=127.0.0.1 ipf=(-p "$BENCH_RT_PORT")
           for k in $(seq 15); do timeout 6 iperf3 -c $ip "${ipf[@]}" -t 1 --connect-timeout 2000 >/dev/null 2>&1 && break; sleep 1; done
           (( k < 15 )) || { echo "no connection"; echo "$t fail" >> "$res"; continue; }
-          loss=0 rtt=- jit=-
+          read -r loss rtt jit < <(udp_ping 127.0.0.1 $(( BENCH_RT_PORT + 1 )) 60 0.03)
         else
           ip=$PEER ipf=()
           for k in $(seq 12); do ping -c1 -W1 "$PEER" &>/dev/null && break; sleep 0.3; done
@@ -1121,11 +1216,13 @@ cmd_bench() {
         ujit=$(jget "$tmp/u.json" "d['end']['sum']['jitter_ms']"); uloss=$(jget "$tmp/u.json" "d['end']['sum']['lost_percent']")
         read -r -a c1 < <(cpu_snap)
         local lpid=
-        [[ $TYPE != rathole ]] && { ping -n -q -c 40 -i 0.1 -W 1 "$PEER" > "$tmp/lp" 2>/dev/null & lpid=$!; }
+        if is_port_tun; then udp_ping 127.0.0.1 $(( BENCH_RT_PORT + 1 )) 40 0.1 > "$tmp/lp" 2>/dev/null & lpid=$!
+        else ping -n -q -c 40 -i 0.1 -W 1 "$PEER" > "$tmp/lp" 2>/dev/null & lpid=$!; fi
         "${IP3[@]}" -P 4 -t 5 > "$tmp/up.json" 2>/dev/null
         [[ -n $lpid ]] && wait "$lpid"   # only the ping: a bare wait would also wait on the tunnel processes forever
         read -r -a c2 < <(cpu_snap)
-        lrtt=-; [[ $TYPE != rathole ]] && { lrtt=$(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' "$tmp/lp"); lrtt=${lrtt:--}; }
+        if is_port_tun; then lrtt=$(awk '{print $2}' "$tmp/lp"); else lrtt=$(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' "$tmp/lp"); fi
+        lrtt=${lrtt:--}
         cpu=$(awk -v b1="${c1[0]}" -v t1="${c1[1]}" -v b2="${c2[0]}" -v t2="${c2[1]}" 'BEGIN{d=t2-t1; printf "%.1f", (d > 0 ? (b2-b1)*100/d : 0)}'); cpu=${cpu:-0}
         "${IP3[@]}" -P 4 -t 5 -R > "$tmp/dn.json" 2>/dev/null
         up=$(jget "$tmp/up.json" "d['end']['sum_received']['bits_per_second']/1e6")
@@ -1166,7 +1263,7 @@ if good:
         over = max(0, r['rtt'] - base) if (base and r['rtt'] is not None) else 0
         bloat = max(0, r['lrtt'] - r['rtt']) if (r['lrtt'] is not None and r['rtt'] is not None) else 50
         g = 100 - 2*over - 3*(r['jit'] or 0) - 3*(r['ujit'] or 0) - 8*(r['uloss'] if r['uloss'] is not None else 10) - 8*r['loss'] - 0.3*bloat
-        if r['t'] == 'rathole': g = min(g, 30)   # TCP-based: head-of-line blocking makes it poor for games
+        if r['t'] in ('rathole', 'bp', 'bpmux'): g = min(g, 30)   # TCP-based: head-of-line blocking makes it poor for games
         r['g'] = max(0, min(100, g))
         r['eff'] = r['up'] / max(r['cpu'], 0.5)
     maxeff = max(r['eff'] for r in good) or 1
@@ -1189,7 +1286,8 @@ else:
     print("No tunnel type worked on this route.")
 print("Kernel tunnels and wg are opened by the abroad side: create them with --opener me (abroad) / --opener peer (Iran).")
 print("fecraw = FEC in fake TCP, fecrev = FEC over UDP opened by the abroad side, fecicmp = FEC disguised as ping,")
-print("rathole = reverse TCP tunnel. RTT/JIT ms from 60 pings; UDP* from a game-like stream; LOADED = ping during upload;")
+print("rathole / bp / bpmux = reverse TCP port tunnels (BackPack: warm pool, mux), bpkcp = BackPack over UDP+KCP+FEC.")
+print("RTT/JIT ms from 60 pings (port tunnels: UDP echo); UDP* from a game-like stream; LOADED = ping during upload;")
 print("UP/DOWN = TCP Mbit/s (4 streams); CPU% = this server's total CPU during upload; MTU = largest packet that passed.")
 PY
 }
@@ -1242,7 +1340,7 @@ cmd_menu() {
    7) Gaming priority (QoS)      8) Benchmark tunnel types
    9) Telegram alerts           10) Optimize server
   11) Install FEC + udp2raw     12) Install rathole
-   0) Exit
+  13) Install BackPack           0) Exit
 EOF
     read -rp "> " c; echo
     [[ $c == 0 || $c == q ]] && exit 0
@@ -1261,6 +1359,7 @@ EOF
         10) cmd_optimize ;;
         11) install_fec ;;
         12) install_rathole ;;
+        13) install_backpack ;;
         *) warn "unknown choice" ;;
       esac
     )
@@ -1273,10 +1372,10 @@ usage() {
 LightTun $VERSION
 
   lighttun                         interactive menu
-  lighttun add [--name N --type gre|ipip|vxlan|fou|wg|fec|rathole --local IP --remote IP --addr CIDR
+  lighttun add [--name N --type gre|ipip|vxlan|fou|wg|fec|rathole|backpack --local IP --remote IP --addr CIDR
                --peer IP --priority gaming|normal|bulk --mtu N --key N --port N --vni N
                --role server|client --secret S --raw yes|no --fec 2:4 --tcp "443 8080" --udp "51820"
-               --backup TUNNEL --opener me|peer]
+               --backup TUNNEL --opener me|peer --carrier tcp|tcpmux|kcp]
   lighttun edit [NAME]             edit interactively (or with the same flags)
   lighttun set NAME KEY=VALUE...   change settings, e.g. lighttun set fnland MTU=1400 PRIORITY=gaming
   lighttun del NAME [-y]           delete a tunnel
@@ -1287,7 +1386,7 @@ LightTun $VERSION
   lighttun bench serve|run IP [TYPES]  benchmark tunnel types between two servers (default: all)
   lighttun telegram                set up Telegram alerts
   lighttun optimize                apply server tuning
-  lighttun install fec|rathole     install optional userspace tunnels
+  lighttun install fec|rathole|backpack  install optional userspace tunnels
   lighttun setup | uninstall
 EOF
 }
@@ -1310,7 +1409,7 @@ main() {
     bench) cmd_bench "$@" ;;
     telegram) cmd_telegram ;;
     optimize) cmd_optimize ;;
-    install) case $1 in fec) install_fec ;; rathole) install_rathole ;; *) die "install fec|rathole" ;; esac ;;
+    install) case $1 in fec) install_fec ;; rathole) install_rathole ;; backpack) install_backpack ;; *) die "install fec|rathole|backpack" ;; esac ;;
     setup) cmd_setup ;;
     uninstall) cmd_uninstall ;;
     monitor) cmd_monitor ;;

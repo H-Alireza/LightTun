@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # LightTun installer for Ubuntu.
-#   From a copy of the repo:   sudo bash install.sh [--fec] [--rathole]
+#   From a copy of the repo:   sudo bash install.sh [--fec] [--rathole] [--backpack]
 #   Straight from GitHub:      curl -fsSL https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh | sudo bash -s -- --fec
 set -euo pipefail
 
@@ -12,11 +12,12 @@ BIN=/usr/local/bin/lighttun
 . /etc/os-release
 [[ ${ID:-} == ubuntu ]] || echo "[!] LightTun is built for Ubuntu; continuing on ${PRETTY_NAME:-unknown}"
 
-want_fec=no want_rathole=no
+want_fec=no want_rathole=no want_backpack=no
 for a in "$@"; do
   case $a in
     --fec) want_fec=yes ;;
     --rathole) want_rathole=yes ;;
+    --backpack) want_backpack=yes ;;
     *) echo "unknown option $a"; exit 1 ;;
   esac
 done
@@ -70,5 +71,6 @@ sed -i 's/\r$//' "$BIN"
 "$BIN" setup
 [[ $want_fec == yes ]] && "$BIN" install fec
 [[ $want_rathole == yes ]] && "$BIN" install rathole
+[[ $want_backpack == yes ]] && "$BIN" install backpack
 echo
 echo "[+] done. Run: lighttun"
