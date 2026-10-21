@@ -873,7 +873,7 @@ EOF
 cmd_optimize() {
   need_root
   write_tuning
-  modprobe sch_cake 2>/dev/null || apt-get install -y -qq "linux-modules-extra-$(uname -r)" >/dev/null 2>&1
+  modprobe sch_cake 2>/dev/null || apt-get -o DPkg::Lock::Timeout=600 install -y -qq "linux-modules-extra-$(uname -r)" >/dev/null 2>&1
   systemctl enable --now irqbalance >/dev/null 2>&1
   cmd__boot
   ok "server tuned: BBR, fq, big buffers, conntrack, file limits, NIC rings ($(sysctl -n net.ipv4.tcp_congestion_control))"

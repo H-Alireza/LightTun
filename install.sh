@@ -21,10 +21,18 @@ for a in "$@"; do
   esac
 done
 
-echo "[*] installing packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq iproute2 iptables iputils-ping iperf3 curl ca-certificates conntrack python3 \
+# fresh servers often run unattended-upgrades on first boot; wait for it instead of failing
+lock_busy() { fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; }
+if command -v fuser >/dev/null && lock_busy; then
+  echo "[*] another apt process is running (usually automatic updates) - waiting for it, up to 15 min"
+  for _ in $(seq 180); do lock_busy || break; sleep 5; done
+fi
+APT=(apt-get -o DPkg::Lock::Timeout=600 -y -qq)
+
+echo "[*] installing packages"
+"${APT[@]}" update
+"${APT[@]}" install iproute2 iptables iputils-ping iperf3 curl ca-certificates conntrack python3 \
   unzip tar kmod ethtool irqbalance >/dev/null
 
 src=""
