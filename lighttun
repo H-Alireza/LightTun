@@ -1010,7 +1010,7 @@ cmd_bench() {
         wait $!
         read -r -a c2 < <(cpu_snap)
         lrtt=$(sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' "$tmp/lp"); lrtt=${lrtt:--}
-        local cpu; cpu=$(awk -v b1="${c1[0]}" -v t1="${c1[1]}" -v b2="${c2[0]}" -v t2="${c2[1]}" 'BEGIN{d=t2-t1; printf "%.1f", d>0?(b2-b1)*100/d:0}')
+        local cpu; cpu=$(awk -v b1="${c1[0]}" -v t1="${c1[1]}" -v b2="${c2[0]}" -v t2="${c2[1]}" 'BEGIN{d=t2-t1; printf "%.1f", (d > 0 ? (b2-b1)*100/d : 0)}'); cpu=${cpu:-0}
         iperf3 -c "$PEER" -P 4 -t 6 -R -J > "$tmp/dn.json" 2>/dev/null
         local up dn
         up=$(jget "$tmp/up.json" "d['end']['sum_received']['bits_per_second']/1e6")
