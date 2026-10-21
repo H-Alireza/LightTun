@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # LightTun installer for Ubuntu.
 #   From a copy of the repo:   sudo bash install.sh [--fec] [--rathole]
-#   Straight from GitHub (private repo, needs a token with read access):
-#     curl -fsSL -H "Authorization: token $GH_TOKEN" https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh | sudo GH_TOKEN=$GH_TOKEN bash -s -- --fec
+#   Straight from GitHub:      curl -fsSL https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh | sudo bash -s -- --fec
 set -euo pipefail
 
 REPO="H-Alireza/LightTun"
@@ -39,7 +38,7 @@ else
   auth=()
   [[ -n ${GH_TOKEN:-} ]] && auth=(-H "Authorization: token $GH_TOKEN")
   curl -fsSL "${auth[@]}" "https://raw.githubusercontent.com/$REPO/$BRANCH/lighttun" -o "$BIN" \
-    || { echo "[x] download failed (private repo: set GH_TOKEN)"; exit 1; }
+    || { echo "[x] download failed - check that this server can reach raw.githubusercontent.com"; exit 1; }
   chmod 755 "$BIN"
 fi
 sed -i 's/\r$//' "$BIN"

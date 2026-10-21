@@ -5,17 +5,12 @@ It does the heavy work with kernel tunnels to keep CPU use low, puts gaming traf
 
 ## Install
 
-The repo is private, so either copy it to the server or use a GitHub token:
-
 ```bash
-# from a copy of the repo
-sudo bash install.sh --fec            # --fec adds tinyfecVPN + udp2raw, --rathole adds rathole
-
-# straight from GitHub
-export GH_TOKEN=ghp_xxx
-curl -fsSL -H "Authorization: token $GH_TOKEN" https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh \
-  | sudo GH_TOKEN=$GH_TOKEN bash -s -- --fec
+curl -fsSL https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh | sudo bash -s -- --fec
 ```
+
+`--fec` adds tinyfecVPN + udp2raw, and `--rathole` adds rathole. Drop both for kernel tunnels only.
+To install from a copy of the repo instead, run `sudo bash install.sh --fec`.
 
 Then run `lighttun` to open the menu, or use the commands below.
 
