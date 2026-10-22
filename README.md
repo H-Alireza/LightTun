@@ -49,6 +49,7 @@ lighttun add --name t1 --type vxlan --opener peer --local IRAN   --remote ABROAD
 - `me` (abroad): sends a keepalive every second, so the flow never goes idle. `wg` does this with persistent-keepalive.
 - `peer` (Iran): a kernel firewall rule (iptables `recent`) holds this side's tunnel packets until the abroad side has been heard from in the last 10 s, so Iran never starts the flow. A `wg` tunnel on this side has no endpoint at all.
 - VXLAN and FOU use a fixed source port, so each tunnel is one flow.
+- `--flows N` (VXLAN, same value on both sides) spreads the tunnel over N flows: the Iran side sends from ports PORT+1..PORT+N, and the abroad side opens each of those flows once a second. Upload roughly doubles and the CPU per Gbit/s drops, because the receiving side spreads the work over its CPU cores. It does not lift a cap the route puts on all UDP from abroad (measured 94.139 <- Nuremberg at a throttled hour: 1 flow 150-360 Mbit/s down, 16 flows 260-290; BackPack tcpmux 670-710).
 - It costs almost no CPU, and it is harmless on routes that aren't filtered.
 
 **Don't use GRE on filtered routes.** GRE is not encrypted and the filter reads the packets inside it: pings pass, but TCP connections inside get cut. Use `vxlan` (fastest) or `wg` (encrypted, safest if the filter starts reading VXLAN too).
@@ -109,6 +110,7 @@ The benchmark creates temporary GRE, IPIP, VXLAN, FOU and WireGuard tunnels, all
 - `fecrev`: FEC over plain UDP, opened by the abroad server (reverse)
 - `fecicmp`: FEC disguised as ping
 - `rathole`: reverse TCP tunnel, opened by the abroad server
+- `vxmux`: vxlan with `--flows 16`, opened by the abroad server
 - `bp`, `bpmux`, `bpkcp`: BackPack reverse tunnel over TCP, TCP with mux, and UDP+KCP+FEC, opened by the abroad server
 
 The FEC variants need `install fec`, rathole needs `install rathole`, the BackPack ones need `install backpack` (or an existing `backpack` binary), and `wg` needs `wireguard-tools` (the installer adds it).

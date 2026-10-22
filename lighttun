@@ -15,7 +15,7 @@ OPT=/opt/lighttun
 UNITDIR=/etc/systemd/system
 
 TYPES="gre ipip vxlan fou wg fec rathole backpack"
-TVARS=(NAME TYPE LOCAL_IP REMOTE_IP ADDR PEER MTU TTL PRIORITY PORT KEY VNI ROLE SECRET FEC FEC_TIMEOUT FEC_MODE RAW FWD_TCP FWD_UDP BACKUP CHECK INTERVAL MAX_LOSS MAX_JITTER OPENER CARRIER)
+TVARS=(NAME TYPE LOCAL_IP REMOTE_IP ADDR PEER MTU TTL PRIORITY PORT KEY VNI ROLE SECRET FEC FEC_TIMEOUT FEC_MODE RAW FWD_TCP FWD_UDP BACKUP CHECK INTERVAL MAX_LOSS MAX_JITTER OPENER CARRIER FLOWS)
 
 if [[ -t 1 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' D=$'\e[2m' W=$'\e[1m' N=$'\e[0m'; else R='' G='' Y='' C='' D='' W='' N=''; fi
 info() { echo "${C}[*]${N} $*"; }
@@ -55,7 +55,7 @@ tunnel_defaults() {
   case $TYPE in
     gre)   : "${MTU:=1420}" ;;
     ipip)  : "${MTU:=1440}" ;;
-    vxlan) : "${MTU:=1400}" "${PORT:=4789}" "${VNI:=100}" ;;
+    vxlan) : "${MTU:=1400}" "${PORT:=4789}" "${VNI:=100}" "${FLOWS:=1}" ;;
     fou)   : "${MTU:=1400}" "${PORT:=5555}" ;;
     wg)    : "${MTU:=1420}" "${PORT:=51830}" ;;
     fec)   : "${MTU:=1300}" "${PORT:=4096}"
@@ -102,7 +102,8 @@ validate_tunnel() {
   fi
   [[ -z $KEY ]] || is_num "$KEY" || die "GRE key must be a number"
   case $TYPE in
-    vxlan) is_num "$VNI" || die "VXLAN needs a numeric VNI" ;;
+    vxlan) is_num "$VNI" || die "VXLAN needs a numeric VNI"
+           [[ $FLOWS =~ ^[0-9]+$ ]] && (( FLOWS >= 1 && FLOWS <= 64 )) || die "flows must be 1-64" ;;
     wg)    [[ -n $SECRET ]] || die "wg needs a secret (both keys are derived from it)"
            command -v wg >/dev/null || die "wg missing: apt install wireguard-tools" ;;
     backpack)
@@ -135,6 +136,12 @@ validate_tunnel() {
     t=$(tvar "$n" TYPE)
     if [[ $TYPE =~ ^(gre|fou)$ && $t =~ ^(gre|fou)$ && $(tvar "$n" KEY) == "$KEY" ]]; then
       die "tunnel '$n' already uses GRE to $REMOTE_IP with key '${KEY:-none}' - set a different --key"
+    fi
+    # a multi-flow vxlan also uses the FLOWS ports above its own
+    if [[ $TYPE == vxlan && $t =~ ^(vxlan|fou|wg)$ ]]; then
+      local p f; p=$(tvar "$n" PORT) f=$(tvar "$n" FLOWS); [[ $t == vxlan && ${f:-1} -gt 1 ]] || f=0
+      (( (f > 0 || FLOWS > 1) && p + f >= PORT && p <= PORT + (FLOWS > 1 ? FLOWS : 0) )) && \
+        die "tunnel '$n' uses port $p, which overlaps this tunnel's ports (vxlan flows use the ports above the tunnel port)"
     fi
     [[ $TYPE == ipip && $t == ipip ]] && die "tunnel '$n' is already IPIP to $REMOTE_IP; use GRE with a key for a second tunnel"
   done
@@ -179,6 +186,8 @@ fw_apply() {   # loaded tunnel
   c=$(fw_chain filter INPUT "$NAME")
   if [[ -n $m && $OPENER == peer ]]; then
     ipt -A "$c" -s "$REMOTE_IP" $m -m recent --name "lt_$NAME" --rsource --set -j ACCEPT
+    # the peer's flow openers (see flow_opener): only there to open the route, never answered
+    [[ $TYPE == vxlan ]] && (( FLOWS > 1 )) && ipt -A "$c" -s "$REMOTE_IP" -p udp --dport "$((PORT + 1)):$((PORT + FLOWS))" -j DROP
   elif [[ -n $m ]]; then
     ipt -A "$c" -s "$REMOTE_IP" $m -j ACCEPT
   fi
@@ -271,9 +280,12 @@ link_up() {   # kernel tunnel types
     ipip)  modprobe ipip 2>/dev/null
            ip link add "$NAME" type ipip local "$LOCAL_IP" remote "$REMOTE_IP" ttl "$TTL" tos "$tos" ;;
     vxlan) modprobe vxlan 2>/dev/null
-           # with an opener the source port is fixed, so the tunnel is one flow the abroad side opened
-           ip link add "$NAME" type vxlan id "$VNI" local "$LOCAL_IP" remote "$REMOTE_IP" dstport "$PORT" ttl "$TTL" tos "$tos" \
-             ${OPENER:+srcport $PORT $((PORT + 1))} ;;
+           # with an opener the source ports are fixed, so the tunnel is flows the abroad side opened: one flow
+           # (port -> port), or FLOWS flows (port+1..port+FLOWS -> port; vxlan hashes each inner connection onto one).
+           # Many flows get past per-flow shaping and spread the receiving side's work over its CPU cores.
+           local sp=(); [[ -n $OPENER ]] && sp=(srcport "$PORT" "$((PORT + 1))")
+           [[ -n $OPENER ]] && (( FLOWS > 1 )) && sp=(srcport "$((PORT + 1))" "$((PORT + 1 + FLOWS))")
+           ip link add "$NAME" type vxlan id "$VNI" local "$LOCAL_IP" remote "$REMOTE_IP" dstport "$PORT" ttl "$TTL" tos "$tos" "${sp[@]}" ;;
     fou)   modprobe fou 2>/dev/null; modprobe ip_gre 2>/dev/null
            ip fou add port "$PORT" ipproto 47 2>/dev/null
            local esp=auto; [[ -n $OPENER ]] && esp=$PORT   # fixed source port: one flow, opened by the abroad side
@@ -399,7 +411,25 @@ cmd__up() {
   return 0
 }
 
-cmd__ka() { load_tunnel "$1"; exec ping -n -q -i 1 -W 1 "$PEER" >/dev/null 2>&1; }
+cmd__ka() {
+  load_tunnel "$1"
+  [[ $TYPE == vxlan ]] && (( FLOWS > 1 )) && { flow_opener & }
+  exec ping -n -q -i 1 -W 1 "$PEER" >/dev/null 2>&1
+}
+
+# multi-flow vxlan, opener=me: the peer sends from ports port+1..port+FLOWS to our port. Open each of those flows
+# from here, once a second, with a tiny packet from our port to that one (raw socket: the kernel vxlan socket owns
+# our port; the peer drops these packets). Our own sends start their flows themselves.
+flow_opener() {
+  exec python3 -c 'import socket,struct,sys,time  # lighttun-flow-opener
+r,p,n=sys.argv[1],int(sys.argv[2]),int(sys.argv[3])
+s=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_UDP)
+while True:
+  for i in range(1,n+1):
+    try: s.sendto(struct.pack("!HHHH",p,p+i,16,0)+bytes(8),(r,0))
+    except OSError: pass
+  time.sleep(1)' "$REMOTE_IP" "$PORT" "$FLOWS"
+}
 
 cmd__down() {
   load_tunnel "$1"
@@ -539,6 +569,11 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
     echo "${D}Filtered routes (e.g. Iran -> abroad) cut flows the Iran side starts. Answer 'me' on the abroad server"
     echo "and 'peer' on the Iran server: the abroad side then always opens the tunnel. Empty = off.${N}"
     OPENER=$(ask "Who sends first: me / peer / empty" "$OPENER")
+    if [[ $TYPE == vxlan && -n $OPENER ]]; then
+      echo "${D}Flows: 1 = one UDP flow. 8-16 = spread over that many flows (gets past per-flow speed limits, uses"
+      echo "more CPU cores). Uses the ports above the tunnel port; same value on both sides.${N}"
+      FLOWS=$(ask "Flows" "$FLOWS")
+    fi
   fi
   if [[ $TYPE == fec ]]; then
     RAW=$(ask "Disguise with udp2raw: yes = fake TCP, icmp = looks like ping, no = plain UDP" "$RAW")
@@ -559,7 +594,7 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
 declare -A FLAGS=([name]=NAME [type]=TYPE [local]=LOCAL_IP [remote]=REMOTE_IP [addr]=ADDR [peer]=PEER [mtu]=MTU [ttl]=TTL
   [priority]=PRIORITY [port]=PORT [key]=KEY [vni]=VNI [role]=ROLE [secret]=SECRET [fec]=FEC [fec-timeout]=FEC_TIMEOUT
   [fec-mode]=FEC_MODE [raw]=RAW [tcp]=FWD_TCP [udp]=FWD_UDP [backup]=BACKUP [check]=CHECK [interval]=INTERVAL
-  [max-loss]=MAX_LOSS [max-jitter]=MAX_JITTER [opener]=OPENER [carrier]=CARRIER)
+  [max-loss]=MAX_LOSS [max-jitter]=MAX_JITTER [opener]=OPENER [carrier]=CARRIER [flows]=FLOWS)
 
 parse_flags() {
   while [[ $# -gt 0 ]]; do
@@ -615,6 +650,7 @@ peer_cmd() {   # loaded tunnel -> matching add command for the other server
   is_l3 && s+=" --addr $PEER/$prefix --peer ${ADDR%/*} --mtu $MTU"
   [[ -n $KEY ]] && s+=" --key $KEY"
   [[ $TYPE == vxlan ]] && s+=" --vni $VNI"
+  [[ $TYPE == vxlan ]] && (( FLOWS > 1 )) && s+=" --flows $FLOWS"
   [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && s+=" --port $PORT"
   [[ $TYPE == backpack ]] && s+=" --carrier $CARRIER"
   [[ -n $role ]] && s+=" --role $role --secret $SECRET"
@@ -1045,8 +1081,8 @@ cmd_uninstall() {
 
 # test types: kernel tunnels (incl. WireGuard), all opened by the serve (abroad) side; FEC over plain UDP /
 # fake TCP / ICMP; fecrev = FEC over plain UDP opened by the serve side; port tunnels opened by the serve side too:
-# rathole, BackPack over tcp (bp), tcp+mux (bpmux) and kcp = UDP with FEC (bpkcp)
-BENCH_TYPES=(gre ipip vxlan fou wg fec fecraw fecrev fecicmp rathole bp bpmux bpkcp)
+# rathole, BackPack over tcp (bp), tcp+mux (bpmux) and kcp = UDP with FEC (bpkcp); vxmux = vxlan over 16 flows
+BENCH_TYPES=(gre ipip vxlan vxmux fou wg fec fecraw fecrev fecicmp rathole bp bpmux bpkcp)
 BENCH_PIDS=()
 BENCH_UP=()
 BENCH_RT_PORT=15201
@@ -1060,6 +1096,7 @@ bench_def() {   # index type role(a|b) peer_public
     gre)   KEY=7001 ;;
     fou)   KEY=7002 PORT=15555 ;;
     vxlan) VNI=7003 PORT=14789 ;;
+    vxmux) TYPE=vxlan VNI=7004 PORT=14800 FLOWS=16 ;;
     wg)    SECRET=lighttun-bench PORT=15820 ;;
     fec*)
       TYPE=fec SECRET=lighttun-bench FEC=10:5 FEC_TIMEOUT=2 FEC_MODE=1 PORT=$(( 16000 + i * 10 )) RAW=no
@@ -1092,6 +1129,7 @@ bench_cleanup() {
   [[ ${#BENCH_PIDS[@]} -gt 0 ]] && kill "${BENCH_PIDS[@]}" 2>/dev/null
   pkill -f -- "--tun-dev ltb_" 2>/dev/null; pkill -f -- "-k lighttun-bench" 2>/dev/null; pkill -f -- "rathole-ltb_" 2>/dev/null
   pkill -f -- "backpack-ltb_" 2>/dev/null; pkill -f -- "lighttun-udp-echo" 2>/dev/null
+  pkill -f -- "lighttun-flow-opener" 2>/dev/null
   sleep 0.5
   for i in "${!BENCH_TYPES[@]}"; do
     bench_def "$i" "${BENCH_TYPES[$i]}" a "$BENCH_PEER"
@@ -1137,6 +1175,7 @@ bench_setup() {   # role peer
     fw_apply
     # the serve (abroad) side opens kernel tunnels and keeps them open (wg: persistent-keepalive)
     [[ $OPENER == me && $TYPE != wg ]] && { ping -n -q -i 1 -W 1 "$PEER" >/dev/null 2>&1 & BENCH_PIDS+=($!); }
+    [[ $OPENER == me && $TYPE == vxlan ]] && (( FLOWS > 1 )) && { flow_opener & BENCH_PIDS+=($!); }
     if [[ $1 == b ]]; then
       if is_port_tun; then
         iperf3 -s -B 127.0.0.1 -p "$BENCH_RT_PORT" >/dev/null 2>&1 & BENCH_PIDS+=($!)
@@ -1296,6 +1335,7 @@ else:
 print("Kernel tunnels and wg are opened by the abroad side: create them with --opener me (abroad) / --opener peer (Iran).")
 print("fecraw = FEC in fake TCP, fecrev = FEC over UDP opened by the abroad side, fecicmp = FEC disguised as ping,")
 print("rathole / bp / bpmux = reverse TCP port tunnels (BackPack: warm pool, mux), bpkcp = BackPack over UDP+KCP+FEC.")
+print("vxmux = vxlan spread over 16 UDP flows (--flows 16): gets past per-flow speed limits.")
 print("RTT/JIT ms from 60 pings (port tunnels: UDP echo); UDP* from a game-like stream; LOADED = ping during upload;")
 print("UP/DOWN = TCP Mbit/s (4 streams); CPU% = this server's CPU during the transfers;")
 print("CPU/G = CPU% per Gbit/s moved (lower = lighter); MTU = largest packet that passed.")
@@ -1385,7 +1425,7 @@ LightTun $VERSION
   lighttun add [--name N --type gre|ipip|vxlan|fou|wg|fec|rathole|backpack --local IP --remote IP --addr CIDR
                --peer IP --priority gaming|normal|bulk --mtu N --key N --port N --vni N
                --role server|client --secret S --raw yes|no --fec 2:4 --tcp "443 8080" --udp "51820"
-               --backup TUNNEL --opener me|peer --carrier tcp|tcpmux|kcp]
+               --backup TUNNEL --opener me|peer --carrier tcp|tcpmux|kcp --flows N]
   lighttun edit [NAME]             edit interactively (or with the same flags)
   lighttun set NAME KEY=VALUE...   change settings, e.g. lighttun set fnland MTU=1400 PRIORITY=gaming
   lighttun del NAME [-y]           delete a tunnel
