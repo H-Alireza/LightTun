@@ -234,6 +234,22 @@ fw_apply() {   # loaded tunnel
     c=$(fw_chain raw PREROUTING "$NAME"); ipt -t raw -A "$c" -s "$REMOTE_IP" $m -j CT --notrack
     c=$(fw_chain raw OUTPUT "$NAME");     ipt -t raw -A "$c" -d "$REMOTE_IP" $m -j CT --notrack
   fi
+  # and for a port tunnel server's sockets: the tunnel port and the users' ports end in a local process, so
+  # nothing needs their state, and a relay with thousands of users spends real CPU tracking them (the INPUT
+  # rules above accept them by port, so a stateful firewall still lets them in)
+  if [[ $TYPE =~ ^(rathole|backpack)$ && $ROLE == server ]]; then
+    local pre out tp up
+    pre=$(fw_chain raw PREROUTING "$NAME") out=$(fw_chain raw OUTPUT "$NAME")
+    tp=$(printf '%s\n' $FWD_TCP | paste -sd, -) up=$(printf '%s\n' $FWD_UDP | paste -sd, -)
+    ipt -t raw -A "$pre" -s "$REMOTE_IP" -p tcp --dport "$PORT" -j CT --notrack
+    ipt -t raw -A "$out" -d "$REMOTE_IP" -p tcp --sport "$PORT" -j CT --notrack
+    [[ $CARRIER == kcp ]] && { ipt -t raw -A "$pre" -s "$REMOTE_IP" -p udp --dport "$PORT" -j CT --notrack
+                               ipt -t raw -A "$out" -d "$REMOTE_IP" -p udp --sport "$PORT" -j CT --notrack; }
+    [[ -n $tp ]] && { ipt -t raw -A "$pre" ! -i lo -p tcp -m multiport --dports "$tp" -j CT --notrack
+                      ipt -t raw -A "$out" ! -o lo -p tcp -m multiport --sports "$tp" -j CT --notrack; }
+    [[ -n $up ]] && { ipt -t raw -A "$pre" ! -i lo -p udp -m multiport --dports "$up" -j CT --notrack
+                      ipt -t raw -A "$out" ! -o lo -p udp -m multiport --sports "$up" -j CT --notrack; }
+  fi
 
   # userspace tunnels and wg: priority mark on outer packets (the other kernel tunnels set it with "tos")
   dscp=$(dscp_of)
@@ -815,9 +831,31 @@ cmd_health() {
 
 # ---------------------------------------------------------------- QoS (gaming priority)
 
+# no QoS: fq on the WAN, which BBR paces through (cheaper than TCP's own pacing timers). default_qdisc only
+# reaches qdiscs created after it is set, so a server tuned without a reboot keeps fq_codel until this runs.
+# Only the kernel's default qdiscs are replaced, never one someone chose (cake, htb, ...).
+wan_fq() {
+  local w q l re='^qdisc (fq_codel|pfifo_fast) [0-9a-f]*: (root|parent ([0-9a-f]*:[0-9a-f]+))'
+  w=$(wan_dev); [[ -n $w ]] || return 0
+  q=$(tc qdisc show dev "$w")
+  grep -qE '^qdisc (fq_codel|pfifo_fast) ' <<<"$q" || return 0
+  # multiqueue NIC: the kernel's own mq has no handle to address its children by, so rebuild it with one
+  # (its new children take default_qdisc, fq)
+  if [[ $q == "qdisc mq 0: root"* ]]; then
+    tc qdisc replace dev "$w" root handle 1: mq 2>/dev/null || return 0
+    q=$(tc qdisc show dev "$w")
+  fi
+  while read -r l; do
+    [[ $l =~ $re ]] || continue
+    if [[ -n ${BASH_REMATCH[3]} ]]; then tc qdisc replace dev "$w" parent "${BASH_REMATCH[3]}" fq
+    else tc qdisc replace dev "$w" root fq; fi
+  done <<<"$q" 2>/dev/null
+  return 0
+}
+
 qos_apply() {
   load_global
-  [[ -n $QOS_WAN && -n $QOS_BW ]] || return 0
+  [[ -n $QOS_WAN && -n $QOS_BW ]] || { wan_fq; return 0; }
   modprobe sch_cake 2>/dev/null
   if tc qdisc replace dev "$QOS_WAN" root cake bandwidth "$QOS_BW" diffserv4 wash 2>/dev/null; then
     [[ $1 == quiet ]] || ok "cake on $QOS_WAN at $QOS_BW: gaming=Voice tin, normal=Best effort, bulk=Bulk tin"
@@ -1033,6 +1071,10 @@ fs.file-max = 2097152
 fs.nr_open = 2097152
 vm.swappiness = 10
 EOF
+  # TCP memory for the whole machine, in pages: pressure at 1/8 of RAM, hard limit at 1/5. The kernel's default
+  # (under 1/11 of RAM) is reached by a relay with thousands of sockets, which then shrinks every buffer.
+  local pg; pg=$(( $(awk '/^MemTotal/{print $2}' /proc/meminfo) * 1024 / $(getconf PAGESIZE) ))
+  echo "net.ipv4.tcp_mem = $(( pg / 12 )) $(( pg / 8 )) $(( pg / 5 ))" >> /etc/sysctl.d/99-lighttun.conf
   printf '%s\n' tcp_bbr sch_fq sch_cake nf_conntrack ip_gre ipip fou vxlan wireguard > /etc/modules-load.d/lighttun.conf
   echo "options nf_conntrack hashsize=262144" > /etc/modprobe.d/lighttun.conf
   printf '* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576\n' > /etc/security/limits.d/lighttun.conf

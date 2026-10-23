@@ -140,14 +140,14 @@ Then it ranks the tunnels with a **gaming score** and a **bulk score**, and remo
 
 ## Server tuning (`lighttun optimize`, applied at install)
 
-- BBR congestion control with fq
-- Large socket buffers
+- BBR congestion control with fq, also put on the WAN at once when QoS is off (no reboot needed)
+- Large socket buffers, and total TCP memory sized to the machine's RAM (hard limit 1/5 of it)
 - A large conntrack table, with longer UDP timeouts so game sessions don't drop
 - 1M file descriptors
 - `rp_filter` off and forwarding on
 - Bigger NIC ring buffers, irqbalance, and the performance CPU governor where available
 - MSS clamping on every tunnel
-- No conntrack for the outer packets of kernel tunnels
+- No conntrack for the outer packets of kernel tunnels, or for a port tunnel server's tunnel port and user ports
 
 Settings are in `/etc/sysctl.d/99-lighttun.conf`.
 
