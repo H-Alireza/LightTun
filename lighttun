@@ -888,7 +888,8 @@ install_rathole() {
   case $(uname -m) in x86_64) t=x86_64-unknown-linux-gnu ;; aarch64) t=aarch64-unknown-linux-musl ;; armv7l) t=armv7-unknown-linux-musleabihf ;; *) die "unsupported arch" ;; esac
   info "downloading rathole"
   curl -fsSL -o "$tmp/r.zip" "https://github.com/rapiz1/rathole/releases/latest/download/rathole-$t.zip" || die "download failed"
-  unzip -qo "$tmp/r.zip" -d "$tmp" && install -m 755 "$tmp/rathole" "$OPT/rathole"
+  { command -v unzip >/dev/null && unzip -qo "$tmp/r.zip" -d "$tmp" && install -m 755 "$tmp/rathole" "$OPT/rathole"; } ||
+    { rm -rf -- "$tmp"; die "could not unpack rathole (is unzip installed?)"; }
   rm -rf -- "$tmp"
   ok "installed $OPT/rathole"
 }
@@ -1137,7 +1138,7 @@ bench_cleanup() {
     [[ $TYPE == fec ]] && udp2raw_clear "$PORT"
   done
   ip fou del port 15555 2>/dev/null
-  rm -f "$STATE"/rathole-ltb_*.toml "$STATE"/backpack-ltb_*.toml
+  rm -f "$STATE"/rathole-ltb_*.toml "$STATE"/backpack-ltb_*   # BackPack leaves a .metrics.json too
   return 0
 }
 
