@@ -7,6 +7,8 @@
 //	server (Iran):   ltcar server -listen 0.0.0.0:PORT -users 0.0.0.0:443,udp:0.0.0.0:443 -token T
 //	client (abroad): ltcar client -remote IRAN_IP:PORT -target 127.0.0.1 -pool 64 -token T
 //
+// LightTun runs it as tunnel type "ltcar" (lighttun install ltcar builds it from this file).
+//
 // UDP rides over the same TCP carriers (raw UDP from abroad is throttled on these routes): each source address on
 // the Iran side is a flow with its own carrier, one datagram per frame, ended after -udp-idle without traffic.
 //
@@ -831,7 +833,8 @@ func main() {
 	target := fs.String("target", "127.0.0.1", "client: host the user ports are forwarded to")
 	pool := fs.Int("pool", 64, "client: idle carriers kept ready")
 	par := fs.Int("par", 16, "client: concurrent dials")
-	token := fs.String("token", "", "shared secret")
+	token := fs.String("token", "", "shared secret (default: $LTCAR_TOKEN, which keeps it out of ps)")
+	name := fs.String("name", "", "name shown in log lines")
 	fs.StringVar(&ccName, "cc", "bbr", "congestion control for carrier sockets (empty: system default)")
 	fs.IntVar(&lowat, "lowat", 0, "TCP_NOTSENT_LOWAT bytes on carrier sockets (0: off)")
 	fs.IntVar(&sockBuf, "buf", 8<<20, "largest SO_RCVBUF/SO_SNDBUF per carrier (0: kernel autotuning)")
@@ -839,7 +842,13 @@ func main() {
 	fs.DurationVar(&udpIdle, "udp-idle", 60*time.Second, "server: end a UDP flow after this long without traffic")
 	fs.Parse(os.Args[2:])
 	if *token == "" {
-		log.Fatal("-token is required")
+		*token = os.Getenv("LTCAR_TOKEN")
+	}
+	if *token == "" {
+		log.Fatal("-token or LTCAR_TOKEN is required")
+	}
+	if *name != "" {
+		log.SetPrefix(*name + " ")
 	}
 	sum := sha256.Sum256([]byte(*token))
 	hello = append(append([]byte{}, magic...), sum[:]...)

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # LightTun - lightweight tunnel manager for Ubuntu servers.
 # Kernel tunnels (GRE, IPIP, VXLAN, GRE-over-UDP/FOU, WireGuard), FEC gaming tunnel (tinyfecVPN + udp2raw),
-# reverse port tunnels (rathole, BackPack with a warm connection pool / KCP+FEC), gaming priority QoS, health monitor with failover, and a benchmark.
+# reverse port tunnels (rathole, BackPack with a warm connection pool / KCP+FEC, ltcar = split TCP with one warm
+# connection per user), gaming priority QoS, health monitor with failover, and a benchmark.
 set -o pipefail
 
 VERSION="0.1.0"
@@ -14,7 +15,7 @@ STATE=/var/lib/lighttun
 OPT=/opt/lighttun
 UNITDIR=/etc/systemd/system
 
-TYPES="gre ipip vxlan fou wg fec rathole backpack"
+TYPES="gre ipip vxlan fou wg fec rathole backpack ltcar"
 TVARS=(NAME TYPE LOCAL_IP REMOTE_IP ADDR PEER MTU TTL PRIORITY PORT KEY VNI ROLE SECRET FEC FEC_TIMEOUT FEC_MODE RAW FWD_TCP FWD_UDP BACKUP CHECK INTERVAL MAX_LOSS MAX_JITTER OPENER CARRIER FLOWS)
 
 if [[ -t 1 ]]; then R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' D=$'\e[2m' W=$'\e[1m' N=$'\e[0m'; else R='' G='' Y='' C='' D='' W='' N=''; fi
@@ -63,6 +64,7 @@ tunnel_defaults() {
            else : "${FEC:=20:10}" "${FEC_TIMEOUT:=8}" "${FEC_MODE:=0}"; fi ;;
     rathole) : "${PORT:=2333}" ;;
     backpack) : "${PORT:=2334}" "${CARRIER:=tcp}" ;;
+    ltcar) : "${PORT:=2335}" ;;
   esac
 }
 
@@ -81,10 +83,10 @@ save_tunnel() {
 
 tunnel_names() { local f; for f in "$TDIR"/*.conf; do [[ -e $f ]] && basename "$f" .conf; done; }
 tvar() { ( . "$TDIR/$1.conf" 2>/dev/null; echo "${!2}" ); }   # read one var of another tunnel
-is_port_tun() { [[ $TYPE =~ ^(rathole|backpack)$ ]]; }   # carries listed ports, no tunnel interface
+is_port_tun() { [[ $TYPE =~ ^(rathole|backpack|ltcar)$ ]]; }   # carries listed ports, no tunnel interface
 is_l3() { ! is_port_tun; }
 is_kernel() { [[ $TYPE =~ ^(gre|ipip|vxlan|fou|wg)$ ]]; }
-unit_of() { case $TYPE in fec|rathole|backpack) echo "lighttun-proc@$NAME.service" ;; *) echo "lighttun@$NAME.service" ;; esac; }
+unit_of() { case $TYPE in fec|rathole|backpack|ltcar) echo "lighttun-proc@$NAME.service" ;; *) echo "lighttun@$NAME.service" ;; esac; }
 tos_of() { case $PRIORITY in gaming) echo 0xb8 ;; bulk) echo 0x20 ;; *) echo 0x00 ;; esac; }   # EF / CS1 / CS0
 dscp_of() { case $PRIORITY in gaming) echo 46 ;; bulk) echo 8 ;; *) echo 0 ;; esac; }
 other_host() { local ip=${1%/*} o; o=${ip##*.}; if (( o % 2 )); then echo "${ip%.*}.$((o + 1))"; else echo "${ip%.*}.$((o - 1))"; fi; }
@@ -108,13 +110,13 @@ validate_tunnel() {
            command -v wg >/dev/null || die "wg missing: apt install wireguard-tools" ;;
     backpack)
       [[ $CARRIER =~ ^(tcp|tcpmux|kcp)$ ]] || die "backpack carrier must be tcp, tcpmux or kcp" ;;&
-    fec|rathole|backpack)
+    fec|rathole|backpack|ltcar)
       [[ $ROLE =~ ^(server|client)$ ]] || die "$TYPE needs role server or client"
       [[ -n $SECRET ]] || die "$TYPE needs a secret" ;;
   esac
-  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && { is_num "$PORT" || die "$TYPE needs a port"; }
+  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack|ltcar)$ ]] && { is_num "$PORT" || die "$TYPE needs a port"; }
   [[ -z $OPENER || $OPENER =~ ^(me|peer)$ ]] || die "opener must be me, peer or empty"
-  [[ -z $OPENER ]] || is_kernel || die "opener is for kernel tunnels (fec/rathole/backpack already have a role)"
+  [[ -z $OPENER ]] || is_kernel || die "opener is for kernel tunnels (fec/rathole/backpack/ltcar already have a role)"
   [[ $RAW =~ ^(yes|no|icmp)$ ]] || die "raw must be yes (fake TCP), icmp or no"
   if [[ $TYPE == fec ]]; then
     local want=1; [[ $ROLE == client ]] && want=2
@@ -196,7 +198,7 @@ fw_apply() {   # loaded tunnel
       ipt -A "$c" -s "$REMOTE_IP" -p udp -m multiport --ports "$PORT" -j ACCEPT
       ipt -A "$c" -s "$REMOTE_IP" -p tcp -m multiport --ports "$PORT" -j ACCEPT
       [[ $RAW == icmp ]] && ipt -A "$c" -s "$REMOTE_IP" -p icmp -j ACCEPT ;;
-    rathole|backpack)
+    rathole|backpack|ltcar)
       if [[ $ROLE == server ]]; then
         ipt -A "$c" -s "$REMOTE_IP" -p tcp --dport "$PORT" -j ACCEPT
         [[ $CARRIER == kcp ]] && ipt -A "$c" -s "$REMOTE_IP" -p udp --dport "$PORT" -j ACCEPT
@@ -237,7 +239,7 @@ fw_apply() {   # loaded tunnel
   # and for a port tunnel server's sockets: the tunnel port and the users' ports end in a local process, so
   # nothing needs their state, and a relay with thousands of users spends real CPU tracking them (the INPUT
   # rules above accept them by port, so a stateful firewall still lets them in)
-  if [[ $TYPE =~ ^(rathole|backpack)$ && $ROLE == server ]]; then
+  if is_port_tun && [[ $ROLE == server ]]; then
     local pre out tp up
     pre=$(fw_chain raw PREROUTING "$NAME") out=$(fw_chain raw OUTPUT "$NAME")
     tp=$(printf '%s\n' $FWD_TCP | paste -sd, -) up=$(printf '%s\n' $FWD_UDP | paste -sd, -)
@@ -253,7 +255,7 @@ fw_apply() {   # loaded tunnel
 
   # userspace tunnels and wg: priority mark on outer packets (the other kernel tunnels set it with "tos")
   dscp=$(dscp_of)
-  if [[ $TYPE =~ ^(fec|rathole|backpack|wg)$ && $dscp != 0 ]]; then
+  if [[ $TYPE =~ ^(fec|rathole|backpack|ltcar|wg)$ && $dscp != 0 ]]; then
     c=$(fw_chain mangle POSTROUTING "$NAME")
     for p in udp tcp; do ipt -t mangle -A "$c" -d "$REMOTE_IP" -p $p -m multiport --ports "$PORT" -j DSCP --set-dscp "$dscp"; done
   fi
@@ -416,6 +418,23 @@ backpack_conf() {
   chmod 600 "$f"; echo "$f"
 }
 
+# ltcar (proto/ltcar): the abroad side keeps a pool of warm connections and gives each user connection or UDP
+# flow its own one, terminated on both sides, so only one TCP crosses the route and no user waits behind another.
+# Carriers are reused with their congestion window intact, and a fixed buffer budget keeps TCP memory bounded.
+# The secret goes in through the environment, not argv (ps shows argv to every user).
+ltcar_exec() {   # [exec] -> runs ltcar for the loaded tunnel
+  local users="" p pre=()
+  [[ $1 == exec ]] && pre=(exec)
+  for p in $FWD_TCP; do users+="${users:+,}0.0.0.0:$p"; done
+  for p in $FWD_UDP; do users+="${users:+,}udp:0.0.0.0:$p"; done
+  export LTCAR_TOKEN=$SECRET
+  if [[ $ROLE == server ]]; then
+    "${pre[@]}" "$OPT/ltcar" server -name "$NAME" -listen "0.0.0.0:$PORT" -users "$users"
+  else
+    "${pre[@]}" "$OPT/ltcar" client -name "$NAME" -remote "$REMOTE_IP:$PORT" -target 127.0.0.1 -pool 64
+  fi
+}
+
 # ---------------------------------------------------------------- internal (systemd) commands
 
 cmd__up() {
@@ -464,6 +483,8 @@ cmd__run() {
              exec "$OPT/rathole" "$(rathole_conf)" ;;
     backpack) [[ -n $(bp_bin) ]] || die "BackPack missing - run: lighttun install backpack"
               exec "$(bp_bin)" -c "$(backpack_conf)" ;;
+    ltcar) [[ -x $OPT/ltcar ]] || die "ltcar missing - run: lighttun install ltcar"
+           ltcar_exec exec ;;
   esac
 }
 
@@ -544,7 +565,8 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
     echo "  6) fec      tinyfecVPN - error correction for lossy routes (gaming)"
     echo "  7) rathole  reverse TCP/UDP port tunnel - when the far side can't accept connections"
     echo "  8) backpack reverse port tunnel with a warm connection pool; kcp carrier = UDP+FEC for gaming"
-    t=$(ask "Choose 1-8" "1")
+    echo "  9) ltcar    reverse TCP/UDP port tunnel, one warm connection per user (fast downloads, UDP not stuck behind TCP)"
+    t=$(ask "Choose 1-9" "1")
     TYPE=$(echo $TYPES | cut -d' ' -f"$t")
     [[ -n $TYPE ]] || die "bad choice"
   fi
@@ -559,7 +581,7 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
       local net=${ADDR%.*}; [[ -n $ADDR ]] || net=$(next_free_net)
       net=$(ask "Tunnel /24 network (server gets .1, client .2)" "$net")
       if [[ $ROLE == server ]]; then ADDR=$net.1/24 PEER=$net.2; else ADDR=$net.2/24 PEER=$net.1; fi ;;
-    rathole|backpack) ;;
+    rathole|backpack|ltcar) ;;
     *)
       ADDR=$(ask "This side's tunnel address" "${ADDR:-$(next_free_net).1/30}")
       PEER=$(ask "Other side's tunnel IP" "${PEER:-$(other_host "$ADDR")}") ;;
@@ -578,9 +600,9 @@ wizard() {   # fills tunnel vars interactively; current values are the defaults
       KEY=$(ask "GRE key (empty = none; needed for a 2nd GRE tunnel to the same server)" "$k") ;;
     vxlan) VNI=$(ask "VXLAN ID" "$VNI") ;;
   esac
-  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && PORT=$(ask "UDP/TCP port" "$PORT")
+  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack|ltcar)$ ]] && PORT=$(ask "UDP/TCP port" "$PORT")
   [[ $TYPE == backpack ]] && CARRIER=$(ask "Carrier: tcp / tcpmux (many short connections) / kcp (UDP+FEC, gaming)" "$CARRIER")
-  if [[ $TYPE =~ ^(wg|fec|rathole|backpack)$ ]]; then SECRET=$(ask "Shared secret (same on both sides)" "${SECRET:-$(rand_secret)}"); fi
+  if [[ $TYPE =~ ^(wg|fec|rathole|backpack|ltcar)$ ]]; then SECRET=$(ask "Shared secret (same on both sides)" "${SECRET:-$(rand_secret)}"); fi
   if is_kernel; then
     echo "${D}Filtered routes (e.g. Iran -> abroad) cut flows the Iran side starts. Answer 'me' on the abroad server"
     echo "and 'peer' on the Iran server: the abroad side then always opens the tunnel. Empty = off.${N}"
@@ -632,6 +654,7 @@ cmd_add() {
   [[ $TYPE == fec && ! -x $OPT/tinyvpn ]] && install_fec
   [[ $TYPE == rathole && ! -x $OPT/rathole ]] && install_rathole
   [[ $TYPE == backpack && -z $(bp_bin) ]] && install_backpack
+  [[ $TYPE == ltcar && ! -x $OPT/ltcar ]] && install_ltcar
   save_tunnel
   start_tunnel
   echo; info "Run this on the other server ($REMOTE_IP):"; echo; peer_cmd; echo
@@ -667,7 +690,7 @@ peer_cmd() {   # loaded tunnel -> matching add command for the other server
   [[ -n $KEY ]] && s+=" --key $KEY"
   [[ $TYPE == vxlan ]] && s+=" --vni $VNI"
   [[ $TYPE == vxlan ]] && (( FLOWS > 1 )) && s+=" --flows $FLOWS"
-  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack)$ ]] && s+=" --port $PORT"
+  [[ $TYPE =~ ^(vxlan|fou|wg|fec|rathole|backpack|ltcar)$ ]] && s+=" --port $PORT"
   [[ $TYPE == backpack ]] && s+=" --carrier $CARRIER"
   [[ -n $role ]] && s+=" --role $role --secret $SECRET"
   [[ $TYPE == wg ]] && s+=" --secret $SECRET"
@@ -945,6 +968,53 @@ install_backpack() {   # github.com/AminMGMT/BackPack (AGPL-3.0), checked agains
   ok "installed $OPT/backpack ($("$OPT/backpack" -v 2>/dev/null | head -1))"
 }
 
+# ltcar has no release binary: it is built here from proto/ltcar/main.go (installed by install.sh, else fetched
+# from the repo) with the server's Go 1.22+, or a temporary Go toolchain that is checked against go.dev's SHA256
+# and removed afterwards. Iran servers often can't reach go.dev: build on the abroad server, copy /opt/lighttun/ltcar
+# over and run "lighttun install ltcar /path/to/ltcar".
+GO_VER=1.23.4
+install_ltcar() {   # [prebuilt binary]
+  need_root; mkdir -p "$OPT"
+  if [[ -n $1 ]]; then
+    [[ -f $1 ]] || die "no file $1"
+    install -m 755 "$1" "$OPT/.ltcar.new"   # a copied file usually lost its exec bit
+    [[ $("$OPT/.ltcar.new" 2>&1) == *"usage: ltcar"* ]] || { rm -f "$OPT/.ltcar.new"; die "$1 is not an ltcar binary"; }   # exits 1 after usage
+    mv -f "$OPT/.ltcar.new" "$OPT/ltcar"; ok "installed $OPT/ltcar"; return
+  fi
+  local tmp a go src u sum; tmp=$(mktemp -d)
+  case $(uname -m) in x86_64) a=amd64 ;; aarch64) a=arm64 ;; armv7l) a=armv6l ;; *) rm -rf -- "$tmp"; die "unsupported arch" ;; esac
+  mkdir -p "$tmp/b"
+  src=$OPT/src/ltcar/main.go
+  if [[ -f $src ]]; then cp "$src" "$tmp/b/main.go"
+  else
+    info "downloading the ltcar source"
+    curl -fsSL -o "$tmp/b/main.go" "https://raw.githubusercontent.com/$REPO/main/proto/ltcar/main.go" \
+      || { rm -rf -- "$tmp"; die "could not download the ltcar source"; }
+  fi
+  printf 'module ltcar\n\ngo 1.22\n' > "$tmp/b/go.mod"
+  go=$(command -v go || { [[ -x /usr/local/go/bin/go ]] && echo /usr/local/go/bin/go; })
+  if [[ -n $go ]] && ! "$go" version | grep -qE 'go1\.(2[2-9]|[3-9][0-9])'; then go=""; fi
+  if [[ -z $go ]]; then
+    for u in https://go.dev/dl https://golang.google.cn/dl; do
+      info "downloading Go $GO_VER from ${u%/dl} (removed after the build)"
+      curl -fsSL -m 300 -o "$tmp/go.tgz" "$u/go$GO_VER.linux-$a.tar.gz" || continue
+      sum=$(curl -fsSL -m 30 "$u/?mode=json&include=all" | python3 -c 'import json,sys
+f=sys.argv[1]
+print(next((x["sha256"] for r in json.load(sys.stdin) for x in r["files"] if x["filename"]==f), ""))' "go$GO_VER.linux-$a.tar.gz")
+      [[ -n $sum ]] && echo "$sum  $tmp/go.tgz" | sha256sum -c --quiet 2>/dev/null && break
+      warn "checksum check failed for the Go download from $u"; rm -f "$tmp/go.tgz"
+    done
+    [[ -f $tmp/go.tgz ]] || { rm -rf -- "$tmp"; die "could not get Go. Build ltcar on a server that can (lighttun install ltcar), copy $OPT/ltcar here and run: lighttun install ltcar /path/to/ltcar"; }
+    tar xzf "$tmp/go.tgz" -C "$tmp" && go=$tmp/go/bin/go
+  fi
+  info "building ltcar"
+  ( cd "$tmp/b" && CGO_ENABLED=0 GOTOOLCHAIN=local GOCACHE=$tmp/cache GOPATH=$tmp/gopath GOFLAGS=-modcacherw \
+      "$go" build -trimpath -ldflags='-s -w' -o "$tmp/ltcar" . ) || { rm -rf -- "$tmp"; die "ltcar build failed"; }
+  install -m 755 "$tmp/ltcar" "$OPT/ltcar"
+  rm -rf -- "$tmp"
+  ok "installed $OPT/ltcar (sha256 $(sha256sum "$OPT/ltcar" | cut -c1-16)...)"
+}
+
 write_units() {
   cat > "$UNITDIR/lighttun-base.service" <<EOF
 [Unit]
@@ -1124,8 +1194,8 @@ cmd_uninstall() {
 
 # test types: kernel tunnels (incl. WireGuard), all opened by the serve (abroad) side; FEC over plain UDP /
 # fake TCP / ICMP; fecrev = FEC over plain UDP opened by the serve side; port tunnels opened by the serve side too:
-# rathole, BackPack over tcp (bp), tcp+mux (bpmux) and kcp = UDP with FEC (bpkcp); vxmux = vxlan over 16 flows
-BENCH_TYPES=(gre ipip vxlan vxmux fou wg fec fecraw fecrev fecicmp rathole bp bpmux bpkcp)
+# rathole, BackPack over tcp (bp), tcp+mux (bpmux) and kcp = UDP with FEC (bpkcp), ltcar; vxmux = vxlan over 16 flows
+BENCH_TYPES=(gre ipip vxlan vxmux fou wg fec fecraw fecrev fecicmp rathole bp bpmux bpkcp ltcar)
 BENCH_PIDS=()
 BENCH_UP=()
 BENCH_RT_PORT=15201
@@ -1147,7 +1217,7 @@ bench_def() {   # index type role(a|b) peer_public
       [[ $t == fecicmp ]] && RAW=icmp
       local srv=b; [[ $t == fecrev ]] && srv=a
       if [[ $role == "$srv" ]]; then ROLE=server ADDR=$net.1/24 PEER=$net.2; else ROLE=client ADDR=$net.2/24 PEER=$net.1; fi ;;
-    rathole|bp*)
+    rathole|bp*|ltcar)
       # each port tunnel carries its own iperf port and, one above it, a UDP echo port for RTT
       BENCH_RT_PORT=$(( 15100 + i * 2 ))
       SECRET=lighttun-bench PORT=$(( 15300 + i )) FWD_TCP=$BENCH_RT_PORT FWD_UDP="$BENCH_RT_PORT $(( BENCH_RT_PORT + 1 ))"
@@ -1171,7 +1241,7 @@ bench_cleanup() {
   local i
   [[ ${#BENCH_PIDS[@]} -gt 0 ]] && kill "${BENCH_PIDS[@]}" 2>/dev/null
   pkill -f -- "--tun-dev ltb_" 2>/dev/null; pkill -f -- "-k lighttun-bench" 2>/dev/null; pkill -f -- "rathole-ltb_" 2>/dev/null
-  pkill -f -- "backpack-ltb_" 2>/dev/null; pkill -f -- "lighttun-udp-echo" 2>/dev/null
+  pkill -f -- "backpack-ltb_" 2>/dev/null; pkill -f -- "lighttun-udp-echo" 2>/dev/null; pkill -f -- "-name ltb_" 2>/dev/null
   pkill -f -- "lighttun-flow-opener" 2>/dev/null
   sleep 0.5
   for i in "${!BENCH_TYPES[@]}"; do
@@ -1198,6 +1268,7 @@ bench_setup() {   # role peer
             [[ $t != fec && ! -x $OPT/udp2raw ]] && continue ;;
       rathole) [[ -x $OPT/rathole ]] || { warn "skip rathole: run 'lighttun install rathole'"; continue; } ;;
       bp*) [[ -n $(bp_bin) ]] || { warn "skip $t: run 'lighttun install backpack'"; continue; } ;;
+      ltcar) [[ -x $OPT/ltcar ]] || { warn "skip ltcar: run 'lighttun install ltcar'"; continue; } ;;
       wg) command -v wg >/dev/null || { warn "skip wg: apt install wireguard-tools"; continue; } ;;
     esac
     bench_def "$i" "$t" "$1" "$2"
@@ -1205,6 +1276,7 @@ bench_setup() {   # role peer
       fec) ( fec_run ) >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
       rathole) "$OPT/rathole" "$(rathole_conf)" >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
       backpack) "$(bp_bin)" -c "$(backpack_conf)" >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
+      ltcar) ( ltcar_exec exec ) >/dev/null 2>&1 & BENCH_PIDS+=($!) ;;
       *) link_up 2>/dev/null || { warn "skip $t: could not create (another tunnel of this kind to this server?)"; continue; } ;;
     esac
     BENCH_UP+=("$i:$t")
@@ -1350,7 +1422,7 @@ if good:
         over = max(0, r['rtt'] - base) if (base and r['rtt'] is not None) else 0
         bloat = max(0, r['lrtt'] - r['rtt']) if (r['lrtt'] is not None and r['rtt'] is not None) else 50
         g = 100 - 2*over - 3*(r['jit'] or 0) - 3*(r['ujit'] or 0) - 8*(r['uloss'] if r['uloss'] is not None else 10) - 8*r['loss'] - 0.3*bloat
-        if r['t'] in ('rathole', 'bp', 'bpmux'): g = min(g, 30)   # TCP-based: head-of-line blocking makes it poor for games
+        if r['t'] in ('rathole', 'bp', 'bpmux', 'ltcar'): g = min(g, 30)   # TCP-based: head-of-line blocking makes it poor for games
         r['g'] = max(0, min(100, g))
         # CPU cost per Gbit/s moved, over the upload and download tests (raw CPU% says little: a slow tunnel looks cheap)
         cpd = r['cpd'] if r['cpd'] is not None else r['cpu']
@@ -1377,7 +1449,8 @@ else:
     print("No tunnel type worked on this route.")
 print("Kernel tunnels and wg are opened by the abroad side: create them with --opener me (abroad) / --opener peer (Iran).")
 print("fecraw = FEC in fake TCP, fecrev = FEC over UDP opened by the abroad side, fecicmp = FEC disguised as ping,")
-print("rathole / bp / bpmux = reverse TCP port tunnels (BackPack: warm pool, mux), bpkcp = BackPack over UDP+KCP+FEC.")
+print("rathole / bp / bpmux = reverse TCP port tunnels (BackPack: warm pool, mux), bpkcp = BackPack over UDP+KCP+FEC,")
+print("ltcar = reverse port tunnel with one warm TCP connection per user connection / UDP flow (no mux).")
 print("vxmux = vxlan spread over 16 UDP flows (--flows 16): gets past per-flow speed limits.")
 print("RTT/JIT ms from 60 pings (port tunnels: UDP echo); UDP* from a game-like stream; LOADED = ping during upload;")
 print("UP/DOWN = TCP Mbit/s (4 streams); CPU% = this server's CPU during the transfers;")
@@ -1433,7 +1506,8 @@ cmd_menu() {
    7) Gaming priority (QoS)      8) Benchmark tunnel types
    9) Telegram alerts           10) Optimize server
   11) Install FEC + udp2raw     12) Install rathole
-  13) Install BackPack           0) Exit
+  13) Install BackPack          14) Install ltcar
+   0) Exit
 EOF
     read -rp "> " c; echo
     [[ $c == 0 || $c == q ]] && exit 0
@@ -1453,6 +1527,7 @@ EOF
         11) install_fec ;;
         12) install_rathole ;;
         13) install_backpack ;;
+        14) install_ltcar ;;
         *) warn "unknown choice" ;;
       esac
     )
@@ -1465,7 +1540,7 @@ usage() {
 LightTun $VERSION
 
   lighttun                         interactive menu
-  lighttun add [--name N --type gre|ipip|vxlan|fou|wg|fec|rathole|backpack --local IP --remote IP --addr CIDR
+  lighttun add [--name N --type gre|ipip|vxlan|fou|wg|fec|rathole|backpack|ltcar --local IP --remote IP --addr CIDR
                --peer IP --priority gaming|normal|bulk --mtu N --key N --port N --vni N
                --role server|client --secret S --raw yes|no --fec 2:4 --tcp "443 8080" --udp "51820"
                --backup TUNNEL --opener me|peer --carrier tcp|tcpmux|kcp --flows N]
@@ -1479,7 +1554,8 @@ LightTun $VERSION
   lighttun bench serve|run IP [TYPES]  benchmark tunnel types between two servers (default: all)
   lighttun telegram                set up Telegram alerts
   lighttun optimize                apply server tuning
-  lighttun install fec|rathole|backpack  install optional userspace tunnels
+  lighttun install fec|rathole|backpack|ltcar [FILE]  install optional userspace tunnels
+                                   (ltcar is built from source; FILE = an ltcar binary copied from another server)
   lighttun setup | uninstall
 EOF
 }
@@ -1502,7 +1578,8 @@ main() {
     bench) cmd_bench "$@" ;;
     telegram) cmd_telegram ;;
     optimize) cmd_optimize ;;
-    install) case $1 in fec) install_fec ;; rathole) install_rathole ;; backpack) install_backpack ;; *) die "install fec|rathole|backpack" ;; esac ;;
+    install) case $1 in fec) install_fec ;; rathole) install_rathole ;; backpack) install_backpack ;; ltcar) install_ltcar "$2" ;;
+             *) die "install fec|rathole|backpack|ltcar" ;; esac ;;
     setup) cmd_setup ;;
     uninstall) cmd_uninstall ;;
     monitor) cmd_monitor ;;

@@ -9,7 +9,7 @@ It does the heavy work with kernel tunnels to keep CPU use low, puts gaming traf
 curl -fsSL https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh | sudo bash -s -- --fec
 ```
 
-`--fec` adds tinyfecVPN + udp2raw, `--rathole` adds rathole and `--backpack` adds [BackPack](https://github.com/AminMGMT/BackPack). Drop them for kernel tunnels only.
+`--fec` adds tinyfecVPN + udp2raw, `--rathole` adds rathole, `--backpack` adds [BackPack](https://github.com/AminMGMT/BackPack) and `--ltcar` builds ltcar (see below). Drop them for kernel tunnels only.
 To install from a copy of the repo instead, run `sudo bash install.sh --fec`.
 
 Then run `lighttun` to open the menu, or use the commands below.
@@ -26,6 +26,7 @@ Then run `lighttun` to open the menu, or use the commands below.
 | `fec` | tinyfecVPN | medium | Lossy routes. Error correction removes lag spikes. Add `--raw yes` to wrap it in fake TCP (udp2raw) where UDP is throttled. |
 | `rathole` | rathole | medium | Reverse TCP/UDP port tunnel, for when the far side can't accept incoming connections. Not for gaming. |
 | `backpack` | BackPack | medium | Reverse port tunnel like rathole, but the abroad side keeps a pool of warm connections (no handshake per new user connection) with heartbeats. `--carrier tcp` (default), `tcpmux` (many short connections) or `kcp` (UDP with error correction). Use `--role server` on Iran, `client` abroad. |
+| `ltcar` | ltcar (this repo, Go) | medium | Reverse TCP/UDP port tunnel. The abroad side keeps a pool of warm connections and gives each user connection or UDP flow its own one, so one user never waits behind another (no mux). UDP is carried over TCP too, and stays responsive while bulk TCP runs. Built from `proto/ltcar` by `lighttun install ltcar` (needs Go 1.22+ or access to go.dev). Where the Iran server cannot download Go, copy `/opt/lighttun/ltcar` from the abroad server and run `lighttun install ltcar /path/to/ltcar`. Use `--role server` on Iran, `client` abroad. |
 
 Every tunnel survives reboots (it runs as a systemd service `lighttun@NAME` or `lighttun-proc@NAME`). Its config is in `/etc/lighttun/tunnels/NAME.conf`.
 
@@ -112,8 +113,9 @@ The benchmark creates temporary GRE, IPIP, VXLAN, FOU and WireGuard tunnels, all
 - `rathole`: reverse TCP tunnel, opened by the abroad server
 - `vxmux`: vxlan with `--flows 16`, opened by the abroad server
 - `bp`, `bpmux`, `bpkcp`: BackPack reverse tunnel over TCP, TCP with mux, and UDP+KCP+FEC, opened by the abroad server
+- `ltcar`: ltcar reverse tunnel (one warm TCP connection per user connection / UDP flow), opened by the abroad server
 
-The FEC variants need `install fec`, rathole needs `install rathole`, the BackPack ones need `install backpack` (or an existing `backpack` binary), and `wg` needs `wireguard-tools` (the installer adds it).
+The FEC variants need `install fec`, rathole needs `install rathole`, the BackPack ones need `install backpack` (or an existing `backpack` binary), ltcar needs `install ltcar`, and `wg` needs `wireguard-tools` (the installer adds it).
 To test only some types, list them on both sides: `lighttun bench serve IP vxlan wg` and `lighttun bench run IP vxlan wg`.
 A type that connects but loses more than half its packets is reported as **BLOCKED** and skipped right away, which is common on filtered Iranian routes.
 
@@ -158,5 +160,5 @@ Settings are in `/etc/sysctl.d/99-lighttun.conf`.
 /etc/lighttun/tunnels/*.conf       one file per tunnel
 /etc/lighttun/lighttun.conf        QoS + Telegram settings
 /var/lib/lighttun/                 health state
-/opt/lighttun/                     tinyvpn, udp2raw, rathole, backpack
+/opt/lighttun/                     tinyvpn, udp2raw, rathole, backpack, ltcar (+ src/ltcar)
 ```

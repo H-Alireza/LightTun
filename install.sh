@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # LightTun installer for Ubuntu.
-#   From a copy of the repo:   sudo bash install.sh [--fec] [--rathole] [--backpack]
+#   From a copy of the repo:   sudo bash install.sh [--fec] [--rathole] [--backpack] [--ltcar]
 #   Straight from GitHub:      curl -fsSL https://raw.githubusercontent.com/H-Alireza/LightTun/main/install.sh | sudo bash -s -- --fec
 set -euo pipefail
 
@@ -12,12 +12,13 @@ BIN=/usr/local/bin/lighttun
 . /etc/os-release
 [[ ${ID:-} == ubuntu ]] || echo "[!] LightTun is built for Ubuntu; continuing on ${PRETTY_NAME:-unknown}"
 
-want_fec=no want_rathole=no want_backpack=no
+want_fec=no want_rathole=no want_backpack=no want_ltcar=no
 for a in "$@"; do
   case $a in
     --fec) want_fec=yes ;;
     --rathole) want_rathole=yes ;;
     --backpack) want_backpack=yes ;;
+    --ltcar) want_ltcar=yes ;;
     *) echo "unknown option $a"; exit 1 ;;
   esac
 done
@@ -58,6 +59,8 @@ if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
 fi
 if [[ -n $src && -f $src ]]; then
   install -m 755 "$src" "$BIN"
+  # ltcar is built from source by "lighttun install ltcar"; keep the source next to the binaries
+  [[ -f $(dirname "$src")/proto/ltcar/main.go ]] && install -D -m 644 "$(dirname "$src")/proto/ltcar/main.go" /opt/lighttun/src/ltcar/main.go
 else
   echo "[*] downloading lighttun from $REPO"
   auth=()
@@ -72,5 +75,6 @@ sed -i 's/\r$//' "$BIN"
 [[ $want_fec == yes ]] && "$BIN" install fec
 [[ $want_rathole == yes ]] && "$BIN" install rathole
 [[ $want_backpack == yes ]] && "$BIN" install backpack
+[[ $want_ltcar == yes ]] && "$BIN" install ltcar
 echo
 echo "[+] done. Run: lighttun"
