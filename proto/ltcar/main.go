@@ -52,7 +52,7 @@ const (
 	fData = 0
 	fFin  = 1
 	fRst  = 2
-	chunk = 256 << 10
+	chunk = 64 << 10 // copy buffer per stream direction; thousands of streams must fit in a 2 GB server
 )
 
 var (
@@ -163,7 +163,7 @@ func newCarrier(c *net.TCPConn) *carrier {
 	c.SetNoDelay(true)
 	c.SetKeepAlive(true)
 	c.SetKeepAlivePeriod(20 * time.Second)
-	return &carrier{c: c, r: bufio.NewReaderSize(c, 64<<10), born: time.Now()}
+	return &carrier{c: c, r: bufio.NewReaderSize(c, 16<<10), born: time.Now()}
 }
 
 func (k *carrier) frame(t byte, p []byte) error { // p has 4 free bytes in front of the payload
@@ -285,10 +285,16 @@ type idle struct {
 	done  chan struct{}
 }
 
+// watch reads the client's pings while the carrier is idle. claim stops it by setting state 1 and then a past read
+// deadline; the state check after this side sets its own deadline covers a claim that lands before (or while) the
+// watcher arms its deadline, which would otherwise override the claim's and leave both waiting forever.
 func (ic *idle) watch() {
 	defer close(ic.done)
 	for {
 		ic.k.c.SetReadDeadline(time.Now().Add(idleMax))
+		if ic.state.Load() != 0 {
+			return
+		}
 		b, err := ic.k.r.ReadByte()
 		if err != nil || b != 0 {
 			if ic.state.CompareAndSwap(0, 2) {
@@ -461,7 +467,7 @@ func dgram(k *carrier, in <-chan []byte, out func([]byte), onEnd func(), ack boo
 	upDone := make(chan struct{})
 	go func() {
 		defer close(upDone)
-		b := make([]byte, 0, chunk)
+		b := make([]byte, 0, 2048) // grows with the batch
 		add := func(p []byte) {
 			n := len(p)
 			b = append(b, fData, byte(n>>16), byte(n>>8), byte(n))
@@ -514,7 +520,7 @@ func dgram(k *carrier, in <-chan []byte, out func([]byte), onEnd func(), ack boo
 		k.c.SetReadDeadline(time.Time{})
 	}
 	hdr := make([]byte, 4)
-	buf := make([]byte, 1<<16)
+	buf := make([]byte, 2048) // grows to the largest datagram seen: thousands of flows must stay cheap
 	for !broken.Load() {
 		if _, err := io.ReadFull(k.r, hdr); err != nil {
 			broken.Store(true)
@@ -524,9 +530,12 @@ func dgram(k *carrier, in <-chan []byte, out func([]byte), onEnd func(), ack boo
 		if hdr[0] != fData {
 			break
 		}
-		if n > len(buf) {
+		if n > 1<<16 {
 			broken.Store(true)
 			break
+		}
+		if n > len(buf) {
+			buf = make([]byte, n)
 		}
 		if _, err := io.ReadFull(k.r, buf[:n]); err != nil {
 			broken.Store(true)

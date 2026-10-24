@@ -431,7 +431,9 @@ ltcar_exec() {   # [exec] -> runs ltcar for the loaded tunnel
   if [[ $ROLE == server ]]; then
     "${pre[@]}" "$OPT/ltcar" server -name "$NAME" -listen "0.0.0.0:$PORT" -users "$users"
   else
-    "${pre[@]}" "$OPT/ltcar" client -name "$NAME" -remote "$REMOTE_IP:$PORT" -target 127.0.0.1 -pool 64
+    # every user connection and UDP flow takes its own carrier: when a relay restarts, hundreds of users
+    # reconnect within seconds, so keep a deep pool and dial replacements wide
+    "${pre[@]}" "$OPT/ltcar" client -name "$NAME" -remote "$REMOTE_IP:$PORT" -target 127.0.0.1 -pool 256 -par 64
   fi
 }
 
